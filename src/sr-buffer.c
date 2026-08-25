@@ -76,20 +76,50 @@ void sr_buffer_set_extradata(struct sr_buffer *b, const uint8_t *data, int size)
 	pthread_mutex_unlock(&b->mutex);
 }
 
+static struct sr_packet *video_at(struct sr_buffer *b, size_t idx)
+{
+	return deque_data(&b->video, idx * sizeof(struct sr_packet));
+}
+
+static bool is_keyframe(const struct sr_packet *p)
+{
+	return (p->pkt->flags & AV_PKT_FLAG_KEY) != 0;
+}
+
+/* Drops expired frames from the front. Unless the stream is all-intra a
+ * packet is only decodable together with the keyframe that opens its GOP,
+ * so whole GOPs are dropped at once and only once every frame in them has
+ * expired - the buffer therefore holds up to one extra GOP. */
+static void evict_expired_video(struct sr_buffer *b, uint64_t now)
+{
+	const size_t count = b->video.size / sizeof(struct sr_packet);
+	size_t next_gop = 0;
+
+	for (size_t i = 1; i < count; i++) {
+		if (!is_keyframe(video_at(b, i)))
+			continue;
+		/* the GOP ending right before this keyframe is only expendable
+		 * once its last frame has fallen out of the window */
+		const struct sr_packet *last = video_at(b, i - 1);
+		if (now <= last->ts || now - last->ts <= b->duration_ns)
+			break;
+		next_gop = i;
+	}
+
+	for (size_t i = 0; i < next_gop; i++) {
+		struct sr_packet front;
+		deque_pop_front(&b->video, &front, sizeof(front));
+		free_video_packet(&front);
+	}
+}
+
 void sr_buffer_push_video(struct sr_buffer *b, AVPacket *pkt, uint64_t ts)
 {
 	struct sr_packet entry = {.pkt = pkt, .ts = ts};
 
 	pthread_mutex_lock(&b->mutex);
 	deque_push_back(&b->video, &entry, sizeof(entry));
-
-	struct sr_packet front;
-	deque_peek_front(&b->video, &front, sizeof(front));
-	while (b->video.size > sizeof(entry) && ts > front.ts && ts - front.ts > b->duration_ns) {
-		deque_pop_front(&b->video, &front, sizeof(front));
-		free_video_packet(&front);
-		deque_peek_front(&b->video, &front, sizeof(front));
-	}
+	evict_expired_video(b, ts);
 	pthread_mutex_unlock(&b->mutex);
 }
 

@@ -71,7 +71,7 @@ static enum AVPixelFormat obs_to_av_format(enum video_format format)
 }
 
 static bool open_encoder(struct sr_encoder *enc, const char *name, uint32_t width, uint32_t height, uint32_t fps_num,
-			 uint32_t fps_den, int qp)
+			 uint32_t fps_den, int qp, int keyint)
 {
 	const AVCodec *codec = avcodec_find_encoder_by_name(name);
 	if (!codec)
@@ -81,14 +81,17 @@ static bool open_encoder(struct sr_encoder *enc, const char *name, uint32_t widt
 	if (!ctx)
 		return false;
 
-	/* every frame is an intra frame so the replay can start playback and
-	 * scrub at any position without decoding predecessors */
 	ctx->width = (int)(width & ~1u);
 	ctx->height = (int)(height & ~1u);
 	ctx->pix_fmt = AV_PIX_FMT_NV12;
 	ctx->time_base = (AVRational){(int)fps_den, (int)fps_num};
 	ctx->framerate = (AVRational){(int)fps_num, (int)fps_den};
-	ctx->gop_size = 1;
+	/* keyint 1 means all-intra: any packet decodes on its own, at the cost
+	 * of encoding every frame as a keyframe. Larger intervals are far
+	 * cheaper; playback decodes from the keyframe that opens the GOP. */
+	ctx->gop_size = keyint;
+	/* no B-frames: packets stay in presentation order, so the buffer can
+	 * be cut and played from any point without reordering */
 	ctx->max_b_frames = 0;
 	/* emit SPS/PPS as out-of-band extradata so the stream can be muxed to
 	 * mp4 and decoded from a stored header */
@@ -149,7 +152,7 @@ static bool open_encoder(struct sr_encoder *enc, const char *name, uint32_t widt
 }
 
 struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t fps_num, uint32_t fps_den,
-				     enum sr_encoder_backend backend, int qp)
+				     enum sr_encoder_backend backend, int qp, int keyint)
 {
 	static const char *auto_order[] = {"h264_nvenc", "h264_amf", "h264_qsv", "libx264"};
 	const char *only = NULL;
@@ -171,6 +174,9 @@ struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t f
 		break;
 	}
 
+	if (keyint < 1)
+		keyint = 1;
+
 	struct sr_encoder *enc = bzalloc(sizeof(struct sr_encoder));
 	enc->src_width = width;
 	enc->src_height = height;
@@ -178,16 +184,16 @@ struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t f
 
 	bool opened = false;
 	if (only) {
-		opened = open_encoder(enc, only, width, height, fps_num, fps_den, qp);
+		opened = open_encoder(enc, only, width, height, fps_num, fps_den, qp, keyint);
 		/* an explicitly selected hardware encoder may still be
 		 * missing on this machine; fall back to software */
 		if (!opened && strcmp(only, "libx264") != 0) {
 			obs_log(LOG_WARNING, "encoder '%s' unavailable, falling back to libx264", only);
-			opened = open_encoder(enc, "libx264", width, height, fps_num, fps_den, qp);
+			opened = open_encoder(enc, "libx264", width, height, fps_num, fps_den, qp, keyint);
 		}
 	} else {
 		for (size_t i = 0; i < sizeof(auto_order) / sizeof(auto_order[0]) && !opened; i++)
-			opened = open_encoder(enc, auto_order[i], width, height, fps_num, fps_den, qp);
+			opened = open_encoder(enc, auto_order[i], width, height, fps_num, fps_den, qp, keyint);
 	}
 
 	if (!opened) {
@@ -195,8 +201,8 @@ struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t f
 		return NULL;
 	}
 
-	obs_log(LOG_INFO, "opened replay encoder '%s' (%ux%u, qp %d)", enc->codec->name, enc->ctx->width,
-		enc->ctx->height, qp);
+	obs_log(LOG_INFO, "opened replay encoder '%s' (%ux%u @ %.2f fps, qp %d, keyint %d)", enc->codec->name,
+		enc->ctx->width, enc->ctx->height, (double)fps_num / (double)(fps_den ? fps_den : 1), qp, keyint);
 	return enc;
 }
 

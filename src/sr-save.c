@@ -75,25 +75,32 @@ bool sr_save_replay(const struct sr_replay *r, const char *path)
 		return false;
 	}
 
-	const int64_t first = (int64_t)r->video.array[0].ts;
+	/* a file has to open on a keyframe: anything before the first one
+	 * cannot be decoded on its own */
+	size_t start = 0;
+	while (start < r->video.num && !(r->video.array[start].pkt->flags & AV_PKT_FLAG_KEY))
+		start++;
+	if (start >= r->video.num)
+		start = 0;
+
+	const int64_t first = (int64_t)r->video.array[start].ts;
 	bool ok = true;
 
-	for (size_t i = 0; i < r->video.num && ok; i++) {
+	for (size_t i = start; i < r->video.num && ok; i++) {
 		AVPacket *pkt = av_packet_clone(r->video.array[i].pkt);
 		if (!pkt) {
 			ok = false;
 			break;
 		}
 		pkt->stream_index = st->index;
-		pkt->flags |= AV_PKT_FLAG_KEY; /* every frame is intra */
 
 		const int64_t pts_ns = (int64_t)r->video.array[i].ts - first;
 		int64_t dur_ns;
 		if (i + 1 < r->video.num)
 			dur_ns = (int64_t)r->video.array[i + 1].ts - (int64_t)r->video.array[i].ts;
 		else
-			dur_ns = (r->video.num > 1) ? (int64_t)r->video.array[i].ts - (int64_t)r->video.array[i - 1].ts
-						    : 33333333;
+			dur_ns = (i > start) ? (int64_t)r->video.array[i].ts - (int64_t)r->video.array[i - 1].ts
+					     : 33333333;
 
 		pkt->pts = av_rescale_q(pts_ns, NS_TB, st->time_base);
 		pkt->dts = pkt->pts;
@@ -112,6 +119,6 @@ bool sr_save_replay(const struct sr_replay *r, const char *path)
 	avformat_free_context(oc);
 
 	if (ok)
-		obs_log(LOG_INFO, "sr_save: wrote replay to '%s' (%zu frames)", path, r->video.num);
+		obs_log(LOG_INFO, "sr_save: wrote replay to '%s' (%zu frames)", path, r->video.num - start);
 	return ok;
 }

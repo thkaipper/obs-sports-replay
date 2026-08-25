@@ -87,6 +87,12 @@ struct sr_playback {
 	struct sr_decoder *decoder;
 	int64_t cur_idx; /* index of last decoded/output video packet */
 
+	/* Decoded frames of the GOP being played, so that reverse playback and
+	 * jumps inside a GOP do not decode it again from its keyframe. Holds
+	 * one GOP at most; with an all-intra buffer that is a single frame. */
+	DARRAY(AVFrame *) gop_frames;
+	size_t gop_first_idx; /* replay index of gop_frames.array[0] */
+
 	/* playhead is an absolute timestamp within [first_ts, last_ts] */
 	uint64_t playhead;
 	size_t audio_idx;
@@ -143,6 +149,7 @@ static void find_capture_filter(obs_source_t *parent, obs_source_t *child, void 
 
 static void sr_playback_output_frame_at(struct sr_playback *p, size_t idx);
 static void sr_playback_begin_sequence(struct sr_playback *p);
+static void gop_cache_clear(struct sr_playback *p);
 
 /* Takes ownership of *replay, replacing any current one, and starts playing.
  * end_action_override >= 0 forces that end action (e.g. return-to-scene for
@@ -158,6 +165,7 @@ static void sr_playback_install_replay(struct sr_playback *p, struct sr_replay *
 	p->end_action_override = end_action_override;
 	p->bounce_countdown = 0.0f;
 
+	gop_cache_clear(p);
 	sr_decoder_destroy(p->decoder);
 	p->decoder = sr_decoder_create(p->replay.codec_id, p->replay.extradata, p->replay.extradata_size);
 
@@ -365,18 +373,89 @@ static void output_avframe(struct sr_playback *p, AVFrame *decoded)
 	obs_source_output_video(p->self, &out);
 }
 
+/* Upper bound on cached frames, so that footage encoded elsewhere with a very
+ * long GOP cannot pin an unbounded amount of memory. Beyond it playback still
+ * works, it just decodes from the keyframe again on every backwards step. */
+#define SR_GOP_CACHE_MAX 64
+
+static void gop_cache_clear(struct sr_playback *p)
+{
+	for (size_t i = 0; i < p->gop_frames.num; i++)
+		av_frame_free(&p->gop_frames.array[i]);
+	da_clear(p->gop_frames);
+	p->gop_first_idx = 0;
+}
+
+static AVFrame *gop_cache_get(struct sr_playback *p, size_t idx)
+{
+	if (!p->gop_frames.num || idx < p->gop_first_idx)
+		return NULL;
+	const size_t off = idx - p->gop_first_idx;
+	return (off < p->gop_frames.num) ? p->gop_frames.array[off] : NULL;
+}
+
+static bool packet_is_keyframe(const struct sr_replay *r, size_t idx)
+{
+	return (r->video.array[idx].pkt->flags & AV_PKT_FLAG_KEY) != 0;
+}
+
+/* Keeps a reference to a just-decoded frame. Cloning only takes a reference
+ * to the decoder's buffers, it does not copy the picture. */
+static void gop_cache_push(struct sr_playback *p, size_t idx, AVFrame *frame)
+{
+	const bool starts_gop = packet_is_keyframe(&p->replay, idx);
+	if (starts_gop || idx != p->gop_first_idx + p->gop_frames.num)
+		gop_cache_clear(p);
+	if (p->gop_frames.num >= SR_GOP_CACHE_MAX)
+		return;
+	if (!p->gop_frames.num)
+		p->gop_first_idx = idx;
+
+	AVFrame *ref = av_frame_clone(frame);
+	if (ref)
+		da_push_back(p->gop_frames, &ref);
+}
+
+/* Index of the keyframe that opens idx's GOP. */
+static size_t keyframe_at_or_before(const struct sr_replay *r, size_t idx)
+{
+	while (idx > 0 && !packet_is_keyframe(r, idx))
+		idx--;
+	return idx;
+}
+
 static void sr_playback_output_frame_at(struct sr_playback *p, size_t idx)
 {
 	if (!p->decoder || idx >= p->replay.video.num)
 		return;
 
-	/* all frames are intra frames: a non-sequential jump only needs a
-	 * decoder flush, not decoding from a keyframe */
-	if (p->cur_idx >= 0 && (size_t)(p->cur_idx + 1) != idx)
-		sr_decoder_flush(p->decoder);
+	AVFrame *decoded = gop_cache_get(p, idx);
 
-	AVFrame *decoded = NULL;
-	if (!sr_decoder_decode(p->decoder, p->replay.video.array[idx].pkt, &decoded))
+	if (decoded) {
+		/* already decoded: stepping backwards or replaying a frame */
+	} else if (p->cur_idx >= 0 && (size_t)(p->cur_idx + 1) == idx) {
+		/* moving forward one frame: the decoder holds its references */
+		if (!sr_decoder_decode(p->decoder, p->replay.video.array[idx].pkt, &decoded))
+			return;
+		gop_cache_push(p, idx, decoded);
+	} else {
+		/* jumping: a frame is only decodable from the keyframe that
+		 * opens its GOP, so decode the GOP up to it and keep those
+		 * frames for the steps that follow */
+		const size_t start = keyframe_at_or_before(&p->replay, idx);
+		sr_decoder_flush(p->decoder);
+		gop_cache_clear(p);
+
+		for (size_t i = start; i <= idx; i++) {
+			AVFrame *f = NULL;
+			if (!sr_decoder_decode(p->decoder, p->replay.video.array[i].pkt, &f))
+				return;
+			gop_cache_push(p, i, f);
+			decoded = f;
+		}
+	}
+
+	if (!decoded)
 		return;
 
 	output_avframe(p, decoded);
@@ -504,6 +583,7 @@ static void sr_playback_tick(void *data, float seconds)
 		int hand_over = -1;
 		if (finished) {
 			p->playing = false;
+			gop_cache_clear(p);
 			obs_source_media_ended(p->self);
 			const int ea = sr_playback_effective_end_action(p);
 			if (SR_END_LEAVES_SCENE(ea))
@@ -558,6 +638,7 @@ static void sr_playback_tick(void *data, float seconds)
 			p->phase = PHASE_OUTRO;
 		} else {
 			p->playing = false;
+			gop_cache_clear(p);
 			obs_source_media_ended(p->self);
 			if (SR_END_LEAVES_SCENE(ea))
 				hand_over = ea;
@@ -876,6 +957,7 @@ static void sr_playback_deactivate(void *data)
 		p->playing = false;
 		p->paused = false;
 		p->phase = PHASE_IDLE;
+		gop_cache_clear(p);
 	}
 	pthread_mutex_unlock(&p->mutex);
 
@@ -943,6 +1025,8 @@ static void sr_playback_destroy(void *data)
 
 	if (p->have_replay)
 		sr_replay_free(&p->replay);
+	gop_cache_clear(p);
+	da_free(p->gop_frames);
 	sr_decoder_destroy(p->decoder);
 	sr_clip_close(p->intro_clip);
 	sr_clip_close(p->outro_clip);

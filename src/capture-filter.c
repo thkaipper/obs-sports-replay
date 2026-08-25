@@ -27,6 +27,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_DURATION "duration_ms"
 #define S_ENCODER "encoder"
 #define S_QUALITY "quality"
+#define S_KEYINT "keyint"
+#define S_FPS "capture_fps"
 
 struct sr_capture {
 	obs_source_t *self;
@@ -35,6 +37,13 @@ struct sr_capture {
 
 	enum sr_encoder_backend backend;
 	int qp;
+	int keyint;
+	int capture_fps; /* 0 = encode every frame the source delivers */
+
+	/* frame rate limiter state */
+	uint64_t frame_interval_ns;
+	uint64_t last_kept_ts;
+	bool have_last_kept;
 
 	/* format the current encoder was opened with */
 	uint32_t enc_width;
@@ -65,9 +74,16 @@ static void sr_capture_update(void *data, obs_data_t *settings)
 
 	const enum sr_encoder_backend backend = (enum sr_encoder_backend)obs_data_get_int(settings, S_ENCODER);
 	const int qp = (int)obs_data_get_int(settings, S_QUALITY);
-	if (backend != c->backend || qp != c->qp) {
+	const int keyint = (int)obs_data_get_int(settings, S_KEYINT);
+	const int fps = (int)obs_data_get_int(settings, S_FPS);
+
+	if (backend != c->backend || qp != c->qp || keyint != c->keyint || fps != c->capture_fps) {
 		c->backend = backend;
 		c->qp = qp;
+		c->keyint = keyint;
+		c->capture_fps = fps;
+		c->frame_interval_ns = (fps > 0) ? 1000000000ULL / (uint64_t)fps : 0;
+		c->have_last_kept = false;
 		c->reset_encoder = true;
 		c->encoder_failed = false;
 	}
@@ -80,6 +96,7 @@ static void *sr_capture_create(obs_data_t *settings, obs_source_t *source)
 	sr_buffer_init(&c->buffer);
 	c->backend = SR_ENC_AUTO;
 	c->qp = 23;
+	c->keyint = SR_DEFAULT_KEYINT;
 	sr_capture_update(c, settings);
 	return c;
 }
@@ -102,11 +119,37 @@ static void log_buffer_stats(struct sr_capture *c, uint64_t now)
 		(double)bytes / (1024.0 * 1024.0));
 }
 
+/* Frame rate limiter. With a capture rate configured, frames that arrive
+ * ahead of the next slot never reach the encoder. The quarter-interval
+ * tolerance keeps a 60 fps source asked for 30 fps from falling to 20 when
+ * its timestamps jitter. */
+static bool sr_capture_keep_frame(struct sr_capture *c, uint64_t ts)
+{
+	if (!c->frame_interval_ns)
+		return true;
+
+	/* first frame, or the source restarted and its clock went backwards */
+	if (!c->have_last_kept || ts < c->last_kept_ts) {
+		c->have_last_kept = true;
+		c->last_kept_ts = ts;
+		return true;
+	}
+
+	if (ts - c->last_kept_ts + c->frame_interval_ns / 4 < c->frame_interval_ns)
+		return false;
+
+	c->last_kept_ts = ts;
+	return true;
+}
+
 static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_source_frame *frame)
 {
 	struct sr_capture *c = data;
 
 	if (!frame || !frame->data[0] || c->encoder_failed)
+		return frame;
+
+	if (!sr_capture_keep_frame(c, frame->timestamp))
 		return frame;
 
 	if (c->encoder && (c->reset_encoder || frame->width != c->enc_width || frame->height != c->enc_height)) {
@@ -116,10 +159,16 @@ static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_s
 	}
 
 	if (!c->encoder) {
-		struct obs_video_info ovi;
-		obs_get_video_info(&ovi);
+		uint32_t fps_num = (uint32_t)c->capture_fps;
+		uint32_t fps_den = 1;
+		if (!c->capture_fps) {
+			struct obs_video_info ovi;
+			obs_get_video_info(&ovi);
+			fps_num = ovi.fps_num;
+			fps_den = ovi.fps_den;
+		}
 		c->encoder =
-			sr_encoder_create(frame->width, frame->height, ovi.fps_num, ovi.fps_den, c->backend, c->qp);
+			sr_encoder_create(frame->width, frame->height, fps_num, fps_den, c->backend, c->qp, c->keyint);
 		if (!c->encoder) {
 			obs_log(LOG_ERROR, "'%s': no H.264 encoder available, replay capture disabled",
 				obs_source_get_name(c->self));
@@ -193,6 +242,22 @@ static obs_properties_t *sr_capture_properties(void *unused)
 	obs_property_list_add_int(p, obs_module_text("Quality.Medium"), 23);
 	obs_property_list_add_int(p, obs_module_text("Quality.Low"), 28);
 
+	p = obs_properties_add_list(props, S_FPS, obs_module_text("CaptureFps"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("CaptureFps.Auto"), 0);
+	obs_property_list_add_int(p, "60", 60);
+	obs_property_list_add_int(p, "50", 50);
+	obs_property_list_add_int(p, "30", 30);
+	obs_property_list_add_int(p, "25", 25);
+	obs_property_set_long_description(p, obs_module_text("CaptureFps.Tip"));
+
+	p = obs_properties_add_list(props, S_KEYINT, obs_module_text("Keyint"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Keyint.All"), 1);
+	obs_property_list_add_int(p, obs_module_text("Keyint.Balanced"), 15);
+	obs_property_list_add_int(p, obs_module_text("Keyint.Light"), 30);
+	obs_property_set_long_description(p, obs_module_text("Keyint.Tip"));
+
 	char credit[256];
 	obs_properties_add_text(props, "sr_credit", sr_plugin_credit_html(credit, sizeof(credit)), OBS_TEXT_INFO);
 
@@ -204,6 +269,8 @@ static void sr_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_DURATION, 15000);
 	obs_data_set_default_int(settings, S_ENCODER, SR_ENC_AUTO);
 	obs_data_set_default_int(settings, S_QUALITY, 23);
+	obs_data_set_default_int(settings, S_FPS, 0);
+	obs_data_set_default_int(settings, S_KEYINT, SR_DEFAULT_KEYINT);
 }
 
 struct obs_source_info sr_capture_info = {
