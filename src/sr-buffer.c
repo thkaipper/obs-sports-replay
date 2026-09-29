@@ -135,6 +135,21 @@ void sr_buffer_push_audio(struct sr_buffer *b, const struct obs_audio_data *audi
 	}
 
 	pthread_mutex_lock(&b->mutex);
+
+	/* the source restarted and its clock went backwards: the buffered audio
+	 * would never expire against the new timeline */
+	if (b->audio.size) {
+		struct sr_audio_chunk back;
+		deque_peek_back(&b->audio, &back, sizeof(back));
+		if (chunk.ts < back.ts) {
+			while (b->audio.size) {
+				struct sr_audio_chunk old;
+				deque_pop_front(&b->audio, &old, sizeof(old));
+				free_audio_chunk(&old);
+			}
+		}
+	}
+
 	deque_push_back(&b->audio, &chunk, sizeof(chunk));
 
 	struct sr_audio_chunk front;

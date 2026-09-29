@@ -51,6 +51,10 @@ struct sr_capture {
 	bool encoder_failed;
 	bool reset_encoder;
 
+	/* timestamp of the last frame the source delivered */
+	uint64_t last_frame_ts;
+	bool have_last_frame;
+
 	uint64_t last_stats_log;
 };
 
@@ -109,14 +113,39 @@ static void sr_capture_destroy(void *data)
 	bfree(c);
 }
 
+/* Every capture filter carries the same default name, so log lines name the
+ * source the filter is attached to. */
+static const char *sr_capture_log_name(const struct sr_capture *c)
+{
+	obs_source_t *parent = obs_filter_get_parent(c->self);
+	return parent ? obs_source_get_name(parent) : obs_source_get_name(c->self);
+}
+
 static void log_buffer_stats(struct sr_capture *c, uint64_t now)
 {
 	if (c->last_stats_log && now - c->last_stats_log < 60000000000ULL)
 		return;
 	c->last_stats_log = now;
 	const size_t bytes = sr_buffer_video_bytes(&c->buffer);
-	obs_log(LOG_INFO, "'%s': replay buffer using %.1f MB", obs_source_get_name(c->self),
+	obs_log(LOG_INFO, "'%s': replay buffer using %.1f MB", sr_capture_log_name(c),
 		(double)bytes / (1024.0 * 1024.0));
+}
+
+/* A source that restarts (a capture device reopened with new settings, a
+ * feed coming back after a drop) starts its clock over. The buffered frames
+ * belong to the old timeline and would never expire against the new one, so
+ * the buffer grew without bound: start over with a fresh encoder, whose first
+ * packet is a keyframe. */
+static void sr_capture_check_clock(struct sr_capture *c, uint64_t ts)
+{
+	if (c->have_last_frame && ts < c->last_frame_ts) {
+		obs_log(LOG_INFO, "'%s': source clock went backwards, restarting the replay buffer",
+			sr_capture_log_name(c));
+		c->reset_encoder = true;
+		c->last_stats_log = 0;
+	}
+	c->have_last_frame = true;
+	c->last_frame_ts = ts;
 }
 
 /* Frame rate limiter. With a capture rate configured, frames that arrive
@@ -149,6 +178,8 @@ static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_s
 	if (!frame || !frame->data[0] || c->encoder_failed)
 		return frame;
 
+	sr_capture_check_clock(c, frame->timestamp);
+
 	if (!sr_capture_keep_frame(c, frame->timestamp))
 		return frame;
 
@@ -167,11 +198,11 @@ static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_s
 			fps_num = ovi.fps_num;
 			fps_den = ovi.fps_den;
 		}
-		c->encoder =
-			sr_encoder_create(frame->width, frame->height, fps_num, fps_den, c->backend, c->qp, c->keyint);
+		c->encoder = sr_encoder_create(sr_capture_log_name(c), frame->width, frame->height, fps_num, fps_den,
+					       c->backend, c->qp, c->keyint);
 		if (!c->encoder) {
 			obs_log(LOG_ERROR, "'%s': no H.264 encoder available, replay capture disabled",
-				obs_source_get_name(c->self));
+				sr_capture_log_name(c));
 			c->encoder_failed = true;
 			return frame;
 		}

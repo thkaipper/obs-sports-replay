@@ -151,8 +151,8 @@ static bool open_encoder(struct sr_encoder *enc, const char *name, uint32_t widt
 	return true;
 }
 
-struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t fps_num, uint32_t fps_den,
-				     enum sr_encoder_backend backend, int qp, int keyint)
+struct sr_encoder *sr_encoder_create(const char *owner, uint32_t width, uint32_t height, uint32_t fps_num,
+				     uint32_t fps_den, enum sr_encoder_backend backend, int qp, int keyint)
 {
 	static const char *auto_order[] = {"h264_nvenc", "h264_amf", "h264_qsv", "libx264"};
 	const char *only = NULL;
@@ -188,7 +188,7 @@ struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t f
 		/* an explicitly selected hardware encoder may still be
 		 * missing on this machine; fall back to software */
 		if (!opened && strcmp(only, "libx264") != 0) {
-			obs_log(LOG_WARNING, "encoder '%s' unavailable, falling back to libx264", only);
+			obs_log(LOG_WARNING, "'%s': encoder '%s' unavailable, falling back to libx264", owner, only);
 			opened = open_encoder(enc, "libx264", width, height, fps_num, fps_den, qp, keyint);
 		}
 	} else {
@@ -201,8 +201,9 @@ struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t f
 		return NULL;
 	}
 
-	obs_log(LOG_INFO, "opened replay encoder '%s' (%ux%u @ %.2f fps, qp %d, keyint %d)", enc->codec->name,
-		enc->ctx->width, enc->ctx->height, (double)fps_num / (double)(fps_den ? fps_den : 1), qp, keyint);
+	obs_log(LOG_INFO, "'%s': opened replay encoder '%s' (%ux%u @ %.2f fps, qp %d, keyint %d)", owner,
+		enc->codec->name, enc->ctx->width, enc->ctx->height, (double)fps_num / (double)(fps_den ? fps_den : 1),
+		qp, keyint);
 	return enc;
 }
 

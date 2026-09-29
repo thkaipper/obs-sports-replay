@@ -46,9 +46,10 @@ struct sr_decoder;
  * could be opened at all. qp: 0 (best) .. 51 (worst). keyint is the
  * keyframe interval in frames: 1 encodes every frame as an intra frame,
  * which is the most expensive setting for the encoder; larger values cut
- * that cost but make a frame decodable only from its keyframe onwards. */
-struct sr_encoder *sr_encoder_create(uint32_t width, uint32_t height, uint32_t fps_num, uint32_t fps_den,
-				     enum sr_encoder_backend backend, int qp, int keyint);
+ * that cost but make a frame decodable only from its keyframe onwards.
+ * owner names the source in log lines. */
+struct sr_encoder *sr_encoder_create(const char *owner, uint32_t width, uint32_t height, uint32_t fps_num,
+				     uint32_t fps_den, enum sr_encoder_backend backend, int qp, int keyint);
 void sr_encoder_destroy(struct sr_encoder *enc);
 
 /* Encodes one OBS frame (any common format; converted internally).
