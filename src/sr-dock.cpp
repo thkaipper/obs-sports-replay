@@ -70,7 +70,7 @@ static QString T(const char *key)
  * used by other OBS plugins (e.g. Exeldro's). */
 static QLabel *makeCreditLabel(QWidget *parent)
 {
-	char buf[256];
+	char buf[512];
 	auto *label = new QLabel(QString::fromUtf8(sr_plugin_credit_html(buf, sizeof(buf))), parent);
 	label->setTextFormat(Qt::RichText);
 	label->setTextInteractionFlags(Qt::TextBrowserInteraction);

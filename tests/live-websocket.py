@@ -43,7 +43,7 @@ async def main():
 
         info = await vendor("GetPluginInfo")
         assert info["integration_api_version"] == 1
-        assert info["plugin_version"] == "1.3.0"
+        assert info["plugin_version"] == "1.3.1"
         print("PASS: real authenticated WebSocket + Vendor API", flush=True)
         scenes = (await request("GetSceneList"))["scenes"]
         if not any(s["sceneName"] == "Integration Scene" for s in scenes):

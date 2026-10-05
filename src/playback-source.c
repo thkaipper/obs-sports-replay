@@ -1138,7 +1138,7 @@ static obs_properties_t *sr_playback_properties(void *data)
 		obs_properties_add_button2(props, "capture_now", obs_module_text("CaptureNow"), capture_button_clicked,
 					   data);
 
-	char credit[256];
+	char credit[512];
 	obs_properties_add_text(props, "sr_credit", sr_plugin_credit_html(credit, sizeof(credit)), OBS_TEXT_INFO);
 
 	return props;

@@ -1,5 +1,7 @@
 # Sports Replay for OBS Studio
 
+**Manutenção deste fork: [ITSync](https://itsync.xyz).** Versão 1.3.1: crédito da manutenção adicionado ao rodapé, preservando a autoria original da Systec. Consulte [o guia de logos e patrocinadores](docs/patrocinadores-pt-BR.md) e [as notas desta atualização](docs/release-notes-1.3.1-pt-BR.md).
+
 ## Atualização deste fork — 1.3.0
 
 Este fork adiciona integração com sistemas externos ao **OBS Studio 32.2.2 no Windows x64**, usando o `main` upstream como base (commit `3ed1c2f`). A autoria original e a licença GPL foram preservadas.
