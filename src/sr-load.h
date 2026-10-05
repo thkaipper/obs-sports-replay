@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 /* Demuxes a saved replay file back into an sr_replay (encoded packets), so it
- * can be played with the same controls as a live capture. Video only; the
+ * can be played with the same controls as a live capture, including audio. The
  * caller frees with sr_replay_free. Returns false on failure. */
 bool sr_load_replay(const char *path, struct sr_replay *out);
 

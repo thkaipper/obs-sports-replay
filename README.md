@@ -1,9 +1,25 @@
 # Sports Replay for OBS Studio
 
+## Atualização deste fork — 1.3.0
+
+Este fork adiciona integração com sistemas externos ao **OBS Studio 32.2.2 no Windows x64**, usando o `main` upstream como base (commit `3ed1c2f`). A autoria original e a licença GPL foram preservadas.
+
+- **API pelo obs-websocket:** descoberta das câmeras, consulta de saúde, captura e acompanhamento dos replays pelo vendor `sports-replay`.
+- **Captura multicâmera sem playback:** filtros capturam diretamente seus buffers usando um instante de corte comum.
+- **UUID persistente por filtro:** renomear uma fonte não muda a identificação usada pelo sistema externo; filtros duplicados recebem identidade própria.
+- **Eventos idempotentes:** repetir `event_id` + `capture_id` consulta o mesmo trabalho, inclusive após reiniciar o OBS, enquanto o journal for preservado.
+- **Gravação assíncrona com fila limitada:** MP4 com áudio AAC opcional, publicação por `.partial` e evento `ReplaySaved` após a conclusão.
+- **Recuperação e diagnóstico:** status por câmera, identificação de sessão e tratamento de trabalhos interrompidos.
+- **Controles manuais preservados:** hotkeys independentes com migração dos vínculos antigos, integração com playback/dock e tradução pt-BR.
+
+Consulte [as novidades e os limites desta versão](docs/release-notes-1.3.0-pt-BR.md), [a API para integração](docs/vendor-api.md), [instalação e compilação](docs/build-windows.md) e [testes realizados](docs/validation-1.3.0.md).
+
+**Validação:** mídia com AAC, captura de duas câmeras, deduplicação, recuperação após reinício e WebSocket autenticado em OBS 32.2.2 real. RTSP real, encoders de hardware e operação prolongada ainda precisam de validação no ambiente do usuário. Esta versão é uma extensão deste fork; não é uma release oficial do projeto original.
+
 **Low-memory instant replay for live sports broadcasts.**
 
 Sports Replay captures the last seconds of any camera into a **compressed**
-in-memory buffer (hardware H.264 all-intra via NVENC / AMF / QSV, with an
+in-memory buffer (hardware H.264 with configurable keyframes via NVENC / AMF / QSV, with an
 x264 software fallback) instead of holding raw frames in RAM. A 15-second
 1080p60 buffer uses on the order of **tens of megabytes instead of several
 gigabytes**, so multi-camera replay setups run comfortably on ordinary
@@ -39,9 +55,17 @@ while cutting memory use by roughly **50–100×**.
   later.
 - **Multi-camera** — one capture filter per camera; replay any of them.
 
+## Integration update 1.3.0
+
+This fork targets **OBS Studio 32.2.2 Windows x64** and adds a versioned
+`sports-replay` Vendor API, direct filter capture, persistent event/camera
+deduplication, bounded asynchronous saves, atomic MP4 publication and AAC audio.
+See [Vendor API](docs/vendor-api.md), [build and installation](docs/build-windows.md),
+[validation](docs/validation-1.3.0.md), and [changelog](docs/changelog-1.3.0.md).
+
 ## Requirements
 
-- OBS Studio 31+ (developed and tested on 32.0.2, Windows).
+- OBS Studio 32.2.2 Windows x64 for this fork. Other versions are not validated.
 - A GPU with a hardware H.264 encoder recommended (NVIDIA/AMD/Intel); falls
   back to x264 software encoding otherwise.
 

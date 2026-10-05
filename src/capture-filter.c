@@ -23,6 +23,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "sr-codec.h"
 #include "sr-capture.h"
 #include "sr-credit.h"
+#include "sr-integration.h"
+#include <util/platform.h>
 
 #define S_DURATION "duration_ms"
 #define S_ENCODER "encoder"
@@ -32,6 +34,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 struct sr_capture {
 	obs_source_t *self;
+	pthread_mutex_t state_mutex;
+	char *capture_id;
+	uint64_t last_arrival_ns;
+	uint64_t last_packet_ns;
+	uint64_t clock_resets;
+	uint64_t last_reset_ns;
 	struct sr_buffer buffer;
 	struct sr_encoder *encoder;
 
@@ -49,6 +57,7 @@ struct sr_capture {
 	uint32_t enc_width;
 	uint32_t enc_height;
 	bool encoder_failed;
+	uint64_t encoder_failed_since_ns;
 	bool reset_encoder;
 
 	/* timestamp of the last frame the source delivered */
@@ -70,16 +79,36 @@ static const char *sr_capture_get_name(void *unused)
 	return obs_module_text("SportsReplayCapture");
 }
 
-static void sr_capture_update(void *data, obs_data_t *settings)
+static void sr_capture_update_impl(void *data, obs_data_t *settings)
 {
 	struct sr_capture *c = data;
 
-	c->buffer.duration_ns = (uint64_t)obs_data_get_int(settings, S_DURATION) * 1000000ULL;
+	obs_data_set_string(settings, "capture_id", c->capture_id ? c->capture_id : "");
+	int64_t duration = obs_data_get_int(settings, S_DURATION);
+	if (duration < 1000)
+		duration = 1000;
+	if (duration > 120000)
+		duration = 120000;
+	pthread_mutex_lock(&c->buffer.mutex);
+	c->buffer.duration_ns = (uint64_t)duration * 1000000ULL;
+	pthread_mutex_unlock(&c->buffer.mutex);
 
-	const enum sr_encoder_backend backend = (enum sr_encoder_backend)obs_data_get_int(settings, S_ENCODER);
-	const int qp = (int)obs_data_get_int(settings, S_QUALITY);
-	const int keyint = (int)obs_data_get_int(settings, S_KEYINT);
-	const int fps = (int)obs_data_get_int(settings, S_FPS);
+	enum sr_encoder_backend backend = (enum sr_encoder_backend)obs_data_get_int(settings, S_ENCODER);
+	int qp = (int)obs_data_get_int(settings, S_QUALITY);
+	int keyint = (int)obs_data_get_int(settings, S_KEYINT);
+	int fps = (int)obs_data_get_int(settings, S_FPS);
+	if (backend < SR_ENC_AUTO || backend > SR_ENC_X264)
+		backend = SR_ENC_AUTO;
+	if (qp < 0)
+		qp = 0;
+	if (qp > 51)
+		qp = 51;
+	if (keyint < 1)
+		keyint = 1;
+	if (keyint > 300)
+		keyint = 300;
+	if (fps < 0 || fps > 240)
+		fps = 0;
 
 	if (backend != c->backend || qp != c->qp || keyint != c->keyint || fps != c->capture_fps) {
 		c->backend = backend;
@@ -93,10 +122,27 @@ static void sr_capture_update(void *data, obs_data_t *settings)
 	}
 }
 
+static void sr_capture_update(void *data, obs_data_t *settings)
+{
+	struct sr_capture *c = data;
+	pthread_mutex_lock(&c->state_mutex);
+	sr_capture_update_impl(data, settings);
+	pthread_mutex_unlock(&c->state_mutex);
+}
+
 static void *sr_capture_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct sr_capture *c = bzalloc(sizeof(struct sr_capture));
 	c->self = source;
+	pthread_mutex_init(&c->state_mutex, NULL);
+	const char *owner = obs_data_get_string(settings, "capture_owner_uuid");
+	const char *source_uuid = obs_source_get_uuid(source);
+	const char *preferred = obs_data_get_string(settings, "capture_id");
+	if (owner && *owner && strcmp(owner, source_uuid))
+		preferred = "";
+	c->capture_id = sr_integration_register_capture(source, preferred);
+	obs_data_set_string(settings, "capture_owner_uuid", source_uuid);
+	obs_data_set_string(settings, "capture_id", c->capture_id);
 	sr_buffer_init(&c->buffer);
 	c->backend = SR_ENC_AUTO;
 	c->qp = 23;
@@ -108,8 +154,11 @@ static void *sr_capture_create(obs_data_t *settings, obs_source_t *source)
 static void sr_capture_destroy(void *data)
 {
 	struct sr_capture *c = data;
+	sr_integration_unregister_capture(c->self);
 	sr_encoder_destroy(c->encoder);
 	sr_buffer_free(&c->buffer);
+	bfree(c->capture_id);
+	pthread_mutex_destroy(&c->state_mutex);
 	bfree(c);
 }
 
@@ -142,6 +191,8 @@ static void sr_capture_check_clock(struct sr_capture *c, uint64_t ts)
 		obs_log(LOG_INFO, "'%s': source clock went backwards, restarting the replay buffer",
 			sr_capture_log_name(c));
 		c->reset_encoder = true;
+		c->clock_resets++;
+		c->last_reset_ns = os_gettime_ns();
 		c->last_stats_log = 0;
 	}
 	c->have_last_frame = true;
@@ -171,12 +222,18 @@ static bool sr_capture_keep_frame(struct sr_capture *c, uint64_t ts)
 	return true;
 }
 
-static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_source_frame *frame)
+static struct obs_source_frame *sr_capture_filter_video_impl(void *data, struct obs_source_frame *frame)
 {
 	struct sr_capture *c = data;
 
-	if (!frame || !frame->data[0] || c->encoder_failed)
+	if (!frame || !frame->data[0])
 		return frame;
+	c->last_arrival_ns = os_gettime_ns();
+	if (c->encoder_failed) {
+		if (c->last_arrival_ns - c->encoder_failed_since_ns < 10000000000ULL)
+			return frame;
+		c->encoder_failed = false;
+	}
 
 	sr_capture_check_clock(c, frame->timestamp);
 
@@ -204,6 +261,7 @@ static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_s
 			obs_log(LOG_ERROR, "'%s': no H.264 encoder available, replay capture disabled",
 				sr_capture_log_name(c));
 			c->encoder_failed = true;
+			c->encoder_failed_since_ns = os_gettime_ns();
 			return frame;
 		}
 		c->reset_encoder = false;
@@ -212,8 +270,8 @@ static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_s
 
 		pthread_mutex_lock(&c->buffer.mutex);
 		c->buffer.codec_id = sr_encoder_codec_id(c->encoder);
-		c->buffer.width = frame->width;
-		c->buffer.height = frame->height;
+		c->buffer.width = frame->width & ~1u;
+		c->buffer.height = frame->height & ~1u;
 		pthread_mutex_unlock(&c->buffer.mutex);
 
 		const uint8_t *extradata = NULL;
@@ -223,14 +281,25 @@ static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_s
 	}
 
 	AVPacket *pkt = sr_encoder_encode(c->encoder, frame);
-	if (pkt)
-		sr_buffer_push_video(&c->buffer, pkt, frame->timestamp);
+	if (pkt) {
+		c->last_packet_ns = os_gettime_ns();
+		sr_buffer_push_video(&c->buffer, pkt, (uint64_t)pkt->pts);
+	}
 
 	log_buffer_stats(c, frame->timestamp);
 	return frame;
 }
 
-static struct obs_audio_data *sr_capture_filter_audio(void *data, struct obs_audio_data *audio)
+static struct obs_source_frame *sr_capture_filter_video(void *data, struct obs_source_frame *frame)
+{
+	struct sr_capture *c = data;
+	pthread_mutex_lock(&c->state_mutex);
+	frame = sr_capture_filter_video_impl(data, frame);
+	pthread_mutex_unlock(&c->state_mutex);
+	return frame;
+}
+
+static struct obs_audio_data *sr_capture_filter_audio_impl(void *data, struct obs_audio_data *audio)
 {
 	struct sr_capture *c = data;
 
@@ -248,6 +317,86 @@ static struct obs_audio_data *sr_capture_filter_audio(void *data, struct obs_aud
 		sr_buffer_push_audio(&c->buffer, audio, get_audio_channels(c->buffer.speakers));
 
 	return audio;
+}
+
+static struct obs_audio_data *sr_capture_filter_audio(void *data, struct obs_audio_data *audio)
+{
+	struct sr_capture *c = data;
+	pthread_mutex_lock(&c->state_mutex);
+	if (audio)
+		audio = sr_capture_filter_audio_impl(data, audio);
+	pthread_mutex_unlock(&c->state_mutex);
+	return audio;
+}
+
+bool sr_capture_snapshot_at(void *data, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns)
+{
+	struct sr_capture *c = data;
+	pthread_mutex_lock(&c->state_mutex);
+	bool ok = sr_buffer_snapshot_at(&c->buffer, out, cutoff_ns, duration_ns);
+	pthread_mutex_unlock(&c->state_mutex);
+	return ok;
+}
+
+obs_data_t *sr_capture_health(void *data)
+{
+	struct sr_capture *c = data;
+	obs_data_t *d = obs_data_create();
+	pthread_mutex_lock(&c->state_mutex);
+	uint64_t now = os_gettime_ns();
+	obs_data_set_string(d, "capture_id", c->capture_id);
+	obs_source_t *parent = obs_filter_get_parent(c->self);
+	obs_data_set_string(d, "source_name", parent ? obs_source_get_name(parent) : "");
+	obs_data_set_string(d, "filter_name", obs_source_get_name(c->self));
+	obs_data_set_int(d, "last_frame_age_ms",
+			 c->last_arrival_ns ? (int64_t)((now - c->last_arrival_ns) / 1000000) : -1);
+	obs_data_set_int(d, "last_packet_age_ms",
+			 c->last_packet_ns ? (int64_t)((now - c->last_packet_ns) / 1000000) : -1);
+	obs_data_set_int(d, "clock_resets", (int64_t)c->clock_resets);
+	obs_data_set_int(d, "last_reset_monotonic_ns", (int64_t)c->last_reset_ns);
+	static const char *backends[] = {"auto", "h264_nvenc", "h264_amf", "h264_qsv", "libx264"};
+	const char *requested = c->backend >= 0 && c->backend <= SR_ENC_X264 ? backends[c->backend] : "auto";
+	const char *actual = c->encoder ? sr_encoder_name(c->encoder) : "";
+	obs_data_set_string(d, "encoder_requested", requested);
+	obs_data_set_string(d, "encoder_actual", actual);
+	obs_data_set_string(d, "encoder_error", c->encoder_failed ? "ENCODER_UNAVAILABLE" : "");
+	obs_data_set_int(d, "capture_fps", c->capture_fps);
+	pthread_mutex_lock(&c->buffer.mutex);
+	size_t count = c->buffer.video.size / sizeof(struct sr_packet);
+	uint64_t span = 0;
+	size_t memory = 0;
+	if (count) {
+		struct sr_packet first, last;
+		deque_peek_front(&c->buffer.video, &first, sizeof(first));
+		deque_peek_back(&c->buffer.video, &last, sizeof(last));
+		span = last.ts >= first.ts ? last.ts - first.ts : 0;
+	}
+	for (size_t i = 0; i < count; i++) {
+		struct sr_packet *packet = deque_data(&c->buffer.video, i * sizeof(struct sr_packet));
+		memory += (size_t)packet->pkt->size;
+	}
+	for (size_t i = 0; i < c->buffer.audio.size / sizeof(struct sr_audio_chunk); i++) {
+		struct sr_audio_chunk *chunk = deque_data(&c->buffer.audio, i * sizeof(*chunk));
+		for (size_t ch = 0; ch < MAX_AV_PLANES; ch++)
+			if (chunk->data[ch])
+				memory += chunk->frames * sizeof(float);
+	}
+	obs_data_set_int(d, "buffer_frames", (int64_t)count);
+	obs_data_set_int(d, "buffer_available_ms", (int64_t)(span / 1000000));
+	obs_data_set_int(d, "buffer_duration_ms", (int64_t)(c->buffer.duration_ns / 1000000));
+	obs_data_set_int(d, "memory_bytes", (int64_t)memory);
+	obs_data_set_int(d, "width", c->buffer.width);
+	obs_data_set_int(d, "height", c->buffer.height);
+	obs_data_set_double(d, "fps", span && count > 1 ? (double)(count - 1) * 1e9 / (double)span : 0.0);
+	pthread_mutex_unlock(&c->buffer.mutex);
+	const char *status = c->encoder_failed                                                         ? "ERROR"
+			     : !c->last_arrival_ns || now - c->last_arrival_ns > 5000000000ULL         ? "OFFLINE"
+			     : !count || !c->last_packet_ns || now - c->last_packet_ns > 5000000000ULL ? "ERROR"
+			     : c->backend != SR_ENC_AUTO && strcmp(requested, actual)                  ? "DEGRADED"
+												       : "OK";
+	obs_data_set_string(d, "status", status);
+	pthread_mutex_unlock(&c->state_mutex);
+	return d;
 }
 
 static obs_properties_t *sr_capture_properties(void *unused)

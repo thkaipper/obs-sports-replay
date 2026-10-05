@@ -38,6 +38,7 @@ struct sr_clip {
 
 	AVPacket *pkt;
 	AVFrame *dec_frame; /* raw decoder output */
+	AVFrame *shown;     /* holds the displayed frame while ready advances */
 	AVFrame *ready;     /* scaled I420, the next frame to show */
 	int64_t ready_pts_ns;
 	bool have_ready;
@@ -103,6 +104,7 @@ struct sr_clip *sr_clip_open(const char *path)
 	c->pkt = av_packet_alloc();
 	c->dec_frame = av_frame_alloc();
 	c->ready = av_frame_alloc();
+	c->shown = av_frame_alloc();
 	c->start_pts = AV_NOPTS_VALUE;
 
 	obs_log(LOG_INFO, "sr_clip: opened '%s' (%ux%u, %s)", path, c->src_width, c->src_height, codec->name);
@@ -115,6 +117,7 @@ void sr_clip_close(struct sr_clip *c)
 		return;
 	if (c->sws)
 		sws_freeContext(c->sws);
+	av_frame_free(&c->shown);
 	av_frame_free(&c->ready);
 	av_frame_free(&c->dec_frame);
 	av_packet_free(&c->pkt);
@@ -239,7 +242,10 @@ bool sr_clip_advance(struct sr_clip *c, int64_t playhead_ns, AVFrame **out, bool
 
 	bool produced = false;
 	while (c->have_ready && c->ready_pts_ns <= playhead_ns) {
-		*out = c->ready;
+		av_frame_unref(c->shown);
+		if (av_frame_ref(c->shown, c->ready) < 0)
+			return false;
+		*out = c->shown;
 		produced = true;
 		c->have_ready = decode_next(c);
 	}

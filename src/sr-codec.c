@@ -32,6 +32,7 @@ struct sr_encoder {
 	uint32_t src_width;
 	uint32_t src_height;
 	int64_t next_pts;
+	uint64_t timestamps[256];
 	bool unsupported_format_logged;
 };
 
@@ -251,9 +252,12 @@ AVPacket *sr_encoder_encode(struct sr_encoder *enc, const struct obs_source_fram
 
 	sws_scale(enc->sws, src_data, src_linesize, 0, (int)frame->height, enc->frame->data, enc->frame->linesize);
 
-	enc->frame->pts = enc->next_pts++;
-
-	if (avcodec_send_frame(enc->ctx, enc->frame) < 0)
+	enc->frame->pts = enc->next_pts;
+	enc->timestamps[(size_t)enc->next_pts % 256] = frame->timestamp;
+	int sent = avcodec_send_frame(enc->ctx, enc->frame);
+	if (sent >= 0)
+		enc->next_pts++;
+	else if (sent != AVERROR(EAGAIN))
 		return NULL;
 
 	AVPacket *pkt = av_packet_alloc();
@@ -265,6 +269,12 @@ AVPacket *sr_encoder_encode(struct sr_encoder *enc, const struct obs_source_fram
 		av_packet_free(&pkt);
 		return NULL;
 	}
+	if (pkt->pts < 0 || pkt->pts >= enc->next_pts || enc->next_pts - pkt->pts > 256) {
+		av_packet_free(&pkt);
+		return NULL;
+	}
+	pkt->pts = pkt->dts = (int64_t)enc->timestamps[(size_t)pkt->pts % 256];
+	pkt->time_base = (AVRational){1, 1000000000};
 	return pkt;
 }
 

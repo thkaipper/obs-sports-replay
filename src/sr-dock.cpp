@@ -25,6 +25,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QFile>
 #include <util/platform.h>
 
 #include <cstring>
@@ -409,18 +412,29 @@ private:
 				break;
 			QByteArray path = fi.absoluteFilePath().toUtf8();
 
-			QIcon icon;
-			uint8_t *rgba = nullptr;
-			if (sr_thumbnail_rgba(path.constData(), THUMB_W, THUMB_H, &rgba) && rgba) {
-				QImage img(rgba, THUMB_W, THUMB_H, THUMB_W * 4, QImage::Format_RGBA8888);
-				QPixmap pixmap = QPixmap::fromImage(img.copy());
-				if (playedPaths.contains(fi.absoluteFilePath()))
-					drawPlayedBadge(pixmap);
-				icon = QIcon(pixmap);
-				bfree(rgba);
+			QPixmap pixmap = thumbnailCache.value(fi.absoluteFilePath());
+			if (pixmap.isNull()) {
+				uint8_t *rgba = nullptr;
+				if (sr_thumbnail_rgba(path.constData(), THUMB_W, THUMB_H, &rgba) && rgba) {
+					QImage img(rgba, THUMB_W, THUMB_H, THUMB_W * 4, QImage::Format_RGBA8888);
+					pixmap = QPixmap::fromImage(img.copy());
+					bfree(rgba);
+					if (thumbnailCache.size() >= MAX_ITEMS * 2)
+						thumbnailCache.clear();
+					thumbnailCache.insert(fi.absoluteFilePath(), pixmap);
+				}
 			}
-
-			auto *item = new QListWidgetItem(icon, fi.completeBaseName());
+			if (!pixmap.isNull() && playedPaths.contains(fi.absoluteFilePath()))
+				drawPlayedBadge(pixmap);
+			QString display = fi.completeBaseName();
+			QFile metadata(fi.absoluteFilePath() + ".json");
+			if (metadata.open(QIODevice::ReadOnly) && metadata.size() <= 1024 * 1024) {
+				QJsonObject fields = QJsonDocument::fromJson(metadata.readAll()).object();
+				QString source = fields["source_name"].toString();
+				if (!source.isEmpty())
+					display = source + " | " + fields["event_id"].toString();
+			}
+			auto *item = new QListWidgetItem(QIcon(pixmap), display);
 			item->setData(Qt::UserRole, fi.absoluteFilePath());
 			item->setToolTip(fi.fileName());
 			list->addItem(item);
@@ -439,8 +453,36 @@ private:
 		 * captured from, falling back to the first one found if the
 		 * filename doesn't match the expected pattern or no source
 		 * claims that camera anymore */
-		QString cameraName = cameraNameFromFile(QFileInfo(filePath).completeBaseName());
-		QByteArray srcName = cameraName.isEmpty() ? QByteArray() : replaySourceForCamera(cameraName);
+		QString cameraName, captureId;
+		QFile metadata(filePath + ".json");
+		if (metadata.open(QIODevice::ReadOnly) && metadata.size() <= 1024 * 1024) {
+			QJsonObject data = QJsonDocument::fromJson(metadata.readAll()).object();
+			cameraName = data["source_name"].toString();
+			captureId = data["capture_id"].toString();
+		}
+		if (cameraName.isEmpty())
+			cameraName = cameraNameFromFile(QFileInfo(filePath).completeBaseName());
+		QByteArray srcName;
+		if (!captureId.isEmpty()) {
+			QStringList names;
+			obs_enum_sources(enum_replay_sources, &names);
+			for (const QString &name : names) {
+				obs_source_t *candidate = obs_get_source_by_name(name.toUtf8().constData());
+				if (!candidate)
+					continue;
+				obs_data_t *settings = obs_source_get_settings(candidate);
+				bool match = captureId ==
+					     QString::fromUtf8(obs_data_get_string(settings, "capture_id"));
+				obs_data_release(settings);
+				obs_source_release(candidate);
+				if (match) {
+					srcName = name.toUtf8();
+					break;
+				}
+			}
+		}
+		if (srcName.isEmpty() && !cameraName.isEmpty())
+			srcName = replaySourceForCamera(cameraName);
 		if (srcName.isEmpty())
 			srcName = firstReplaySource();
 		if (srcName.isEmpty())
@@ -475,6 +517,7 @@ private:
 	QFileSystemWatcher *watcher = nullptr;
 	QTimer *refreshTimer = nullptr;
 	QSet<QString> playedPaths;
+	QHash<QString, QPixmap> thumbnailCache;
 };
 
 /* The live dock, so replays that go to air from a hotkey can be marked

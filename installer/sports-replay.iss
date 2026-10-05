@@ -3,12 +3,20 @@
 
 #define MyName "Sports Replay for OBS Studio"
 #ifndef MyVersion
-  #define MyVersion "1.0.0"
+  #define MyVersion "1.3.0"
 #endif
 #define MyPublisher "Systec"
 #define MyURL "https://www.systecinformatica.com.ar"
 
+#ifndef PackageDir
+  #define PackageDir "."
+#endif
+
 [Setup]
+AppId=SportsReplayOBSIntegration
+MinVersion=10.0
+CloseApplications=yes
+RestartApplications=no
 AppName={#MyName}
 AppVersion={#MyVersion}
 AppPublisher={#MyPublisher}
@@ -23,17 +31,18 @@ Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
-LicenseFile=LICENSE.txt
+LicenseFile={#PackageDir}\LICENSE.txt
 WizardStyle=modern
 AppSupportURL={#MyURL}
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 
 [Files]
-Source: "sports-replay\bin\64bit\sports-replay.dll"; DestDir: "{app}\obs-plugins\64bit"; Flags: ignoreversion
-Source: "sports-replay\data\locale\*"; DestDir: "{app}\data\obs-plugins\sports-replay\locale"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PackageDir}\sports-replay\bin\64bit\sports-replay.dll"; DestDir: "{app}\obs-plugins\64bit"; Flags: ignoreversion
+Source: "{#PackageDir}\sports-replay\data\locale\*"; DestDir: "{app}\data\obs-plugins\sports-replay\locale"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\data\obs-plugins\sports-replay"

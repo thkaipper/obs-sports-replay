@@ -22,6 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "sr-scene-tracker.h"
 #include "sr-config.h"
 #include "sr-dock.h"
+#include "sr-integration.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -32,6 +33,7 @@ extern struct obs_source_info sr_playback_info;
 bool obs_module_load(void)
 {
 	sr_config_init();
+	sr_integration_init();
 	obs_register_source(&sr_capture_info);
 	obs_register_source(&sr_playback_info);
 	obs_log(LOG_INFO, "Sports Replay loaded (version %s)", PLUGIN_VERSION);
@@ -42,10 +44,12 @@ void obs_module_post_load(void)
 {
 	sr_scene_tracker_start();
 	sr_dock_register();
+	sr_integration_post_load();
 }
 
 void obs_module_unload(void)
 {
+	sr_integration_shutdown();
 	sr_scene_tracker_stop();
 	sr_config_free();
 	obs_log(LOG_INFO, "Sports Replay unloaded");

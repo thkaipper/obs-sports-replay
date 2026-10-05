@@ -8,6 +8,8 @@
 !/data
 !/docs
 !/installer
+!/tests
+!/scripts
 !/src
 !.clang-format
 !.gersemirc

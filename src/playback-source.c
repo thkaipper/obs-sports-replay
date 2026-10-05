@@ -33,6 +33,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "sr-load.h"
 #include "sr-config.h"
 #include "sr-credit.h"
+#include "sr-integration.h"
 
 #include <time.h>
 #include <sys/stat.h>
@@ -78,6 +79,8 @@ struct sr_playback {
 	pthread_mutex_t mutex;
 
 	char *capture_source_name;
+	char *capture_id;
+	bool save_audio;
 
 	struct sr_replay replay;
 	bool have_replay;
@@ -221,78 +224,56 @@ static void sr_playback_hand_over_program(struct sr_playback *p, int end_action)
  * playback state. Returns false when there was nothing to capture. */
 static bool sr_playback_capture_replay_ex(struct sr_playback *p, bool play)
 {
-	if (!p->capture_source_name || !*p->capture_source_name) {
-		obs_log(LOG_WARNING, "'%s': no capture source selected, nothing to replay",
-			obs_source_get_name(p->self));
-		return false;
+	pthread_mutex_lock(&p->mutex);
+	char *name = bstrdup(p->capture_source_name ? p->capture_source_name : "");
+	char *id = bstrdup(p->capture_id ? p->capture_id : "");
+	bool audio = p->save_audio;
+	pthread_mutex_unlock(&p->mutex);
+	obs_source_t *filter = *id ? sr_integration_find_capture(id) : NULL;
+	obs_source_t *target = NULL;
+	if (!filter) {
+		target = obs_get_source_by_name(name);
+		struct find_capture_ctx ctx = {0};
+		if (target)
+			obs_source_enum_filters(target, find_capture_filter, &ctx);
+		if (ctx.found)
+			filter = obs_source_get_ref(ctx.found);
 	}
-
-	obs_source_t *target = obs_get_source_by_name(p->capture_source_name);
-	if (!target) {
-		obs_log(LOG_WARNING, "capture source '%s' not found", p->capture_source_name);
-		return false;
-	}
-
-	struct find_capture_ctx ctx = {0};
-	obs_source_enum_filters(target, find_capture_filter, &ctx);
-
-	struct sr_replay replay;
-	bool got = false;
-	if (ctx.found) {
-		struct sr_buffer *buf = sr_capture_get_buffer(obs_obj_get_data(ctx.found));
-		if (buf)
-			got = sr_buffer_snapshot(buf, &replay);
-	} else {
-		obs_log(LOG_WARNING, "source '%s' has no Sports Replay Capture filter", p->capture_source_name);
+	struct sr_replay replay = {0};
+	bool got = filter && sr_capture_snapshot_at(obs_obj_get_data(filter), &replay, 0, 0);
+	if (filter) {
+		obs_data_t *health = sr_capture_health(obs_obj_get_data(filter));
+		bfree(id);
+		id = bstrdup(obs_data_get_string(health, "capture_id"));
+		bfree(name);
+		name = bstrdup(obs_data_get_string(health, "source_name"));
+		obs_data_release(health);
+		obs_source_release(filter);
 	}
 	obs_source_release(target);
-
-	/* An empty buffer is the most common "nothing happened" case: the camera
-	 * isn't sending video, or its scene has never been live, so the filter
-	 * never saw a frame. Say so instead of failing silently - with autoplay
-	 * this is exactly why the replay scene stays black and never bounces
-	 * back to the previous scene. */
 	if (!got) {
-		obs_log(LOG_WARNING, "'%s': nothing captured - '%s' has no video in the buffer yet",
-			obs_source_get_name(p->self), p->capture_source_name);
+		obs_log(LOG_WARNING, "nothing captured from '%s'", name);
+		bfree(name);
+		bfree(id);
 		return false;
 	}
-
-	/* A replay that plays while this source is live goes to air the moment
-	 * it is captured, so the dock has to show it as already used - the same
-	 * badge a replay launched from the panel gets. Capture-only, and
-	 * captures taken while the replay scene is off air, are not watched by
-	 * anyone and stay unmarked. */
-	const bool goes_to_air = play && obs_source_active(p->self);
-
-	/* auto-save to disk before publishing, while we still solely own the
-	 * snapshot (mux only reads the packets, no re-encode) */
-	char *save_dir = sr_config_get_save_dir();
-	if (save_dir && *save_dir) {
-		char stamp[32];
-		const time_t now = time(NULL);
-		struct tm tmv;
-#ifdef _WIN32
-		localtime_s(&tmv, &now);
-#else
-		localtime_r(&now, &tmv);
-#endif
-		strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tmv);
-
-		struct dstr path = {0};
-		dstr_copy(&path, save_dir);
-		dstr_replace(&path, "\\", "/");
-		if (path.len && dstr_end(&path) != '/')
-			dstr_cat_ch(&path, '/');
-		dstr_cat(&path, p->capture_source_name);
-		dstr_cat_ch(&path, '_');
-		dstr_cat(&path, stamp);
-		dstr_cat(&path, ".mp4");
-		if (sr_save_replay(&replay, path.array) && goes_to_air)
-			sr_dock_mark_played(path.array);
-		dstr_free(&path);
+	pthread_mutex_lock(&p->mutex);
+	bfree(p->capture_id);
+	p->capture_id = bstrdup(id);
+	bfree(p->capture_source_name);
+	p->capture_source_name = bstrdup(name);
+	pthread_mutex_unlock(&p->mutex);
+	obs_data_t *settings = obs_source_get_settings(p->self);
+	obs_data_set_string(settings, "capture_id", id);
+	obs_data_set_string(settings, S_CAPTURE_SOURCE, name);
+	obs_data_release(settings);
+	bool queued = sr_integration_save_manual(&replay, id, name, audio, play && obs_source_active(p->self));
+	bfree(name);
+	bfree(id);
+	if (!play && !queued) {
+		sr_replay_free(&replay);
+		return false;
 	}
-	bfree(save_dir);
 
 	obs_log(LOG_INFO, "captured replay: %zu frames, %.2f s", replay.video.num,
 		(double)(replay.last_ts - replay.first_ts) / 1e9);
@@ -727,8 +708,12 @@ static void hk_faster_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, boo
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
 	struct sr_playback *p = data;
-	if (pressed)
-		set_speed(p, p->speed_percent * 1.5);
+	if (pressed) {
+		pthread_mutex_lock(&p->mutex);
+		double speed = p->speed_percent;
+		pthread_mutex_unlock(&p->mutex);
+		set_speed(p, speed * 1.5);
+	}
 }
 
 static void hk_slower_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -736,8 +721,12 @@ static void hk_slower_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, boo
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
 	struct sr_playback *p = data;
-	if (pressed)
-		set_speed(p, p->speed_percent / 1.5);
+	if (pressed) {
+		pthread_mutex_lock(&p->mutex);
+		double speed = p->speed_percent;
+		pthread_mutex_unlock(&p->mutex);
+		set_speed(p, speed / 1.5);
+	}
 }
 
 static void hk_normal_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -773,10 +762,11 @@ static void hk_reverse_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bo
 		return;
 	pthread_mutex_lock(&p->mutex);
 	p->backward = !p->backward;
+	bool backward = p->backward;
 	pthread_mutex_unlock(&p->mutex);
 
 	obs_data_t *settings = obs_source_get_settings(p->self);
-	obs_data_set_bool(settings, S_BACKWARD, p->backward);
+	obs_data_set_bool(settings, S_BACKWARD, backward);
 	obs_data_release(settings);
 }
 
@@ -868,8 +858,10 @@ static const char *sr_playback_get_name(void *unused)
  * outside the lock; only the pointer swap is guarded. */
 static void reload_clip(struct sr_playback *p, struct sr_clip **clip, char **stored_path, const char *new_path)
 {
+	pthread_mutex_lock(&p->mutex);
 	const bool same = (*stored_path && new_path && strcmp(*stored_path, new_path) == 0) ||
 			  (!*stored_path && (!new_path || !*new_path));
+	pthread_mutex_unlock(&p->mutex);
 	if (same)
 		return;
 
@@ -890,8 +882,29 @@ static void sr_playback_update(void *data, obs_data_t *settings)
 	struct sr_playback *p = data;
 
 	pthread_mutex_lock(&p->mutex);
+	const char *new_name = obs_data_get_string(settings, S_CAPTURE_SOURCE);
+	bool changed = p->capture_source_name && strcmp(p->capture_source_name, new_name) != 0;
+	bfree(p->capture_id);
+	p->capture_id = bstrdup(changed ? "" : obs_data_get_string(settings, "capture_id"));
+	if (changed)
+		obs_data_set_string(settings, "capture_id", "");
+	if (!p->capture_id || !*p->capture_id) {
+		obs_source_t *target = obs_get_source_by_name(new_name);
+		struct find_capture_ctx context = {0};
+		if (target)
+			obs_source_enum_filters(target, find_capture_filter, &context);
+		if (context.found) {
+			obs_data_t *capture_settings = obs_source_get_settings(context.found);
+			bfree(p->capture_id);
+			p->capture_id = bstrdup(obs_data_get_string(capture_settings, "capture_id"));
+			obs_data_set_string(settings, "capture_id", p->capture_id);
+			obs_data_release(capture_settings);
+		}
+		obs_source_release(target);
+	}
+	p->save_audio = obs_data_get_bool(settings, "save_audio");
 	bfree(p->capture_source_name);
-	p->capture_source_name = bstrdup(obs_data_get_string(settings, S_CAPTURE_SOURCE));
+	p->capture_source_name = bstrdup(new_name);
 	p->speed_percent = obs_data_get_double(settings, S_SPEED);
 	p->backward = obs_data_get_bool(settings, S_BACKWARD);
 	p->end_action = (int)obs_data_get_int(settings, S_END_ACTION);
@@ -912,6 +925,7 @@ static void sr_playback_activate(void *data)
 
 	pthread_mutex_lock(&p->mutex);
 	const bool skip = p->skip_next_autocapture;
+	const bool autoplay = p->autoplay;
 	p->skip_next_autocapture = false;
 	pthread_mutex_unlock(&p->mutex);
 
@@ -927,7 +941,7 @@ static void sr_playback_activate(void *data)
 	if (skip)
 		return;
 
-	if (!p->autoplay || sr_playback_capture_replay(p))
+	if (!autoplay || sr_playback_capture_replay(p))
 		return;
 
 	/* Nothing to show. Sitting on a black replay scene mid-broadcast is
@@ -967,6 +981,26 @@ static void sr_playback_deactivate(void *data)
 		obs_log(LOG_INFO, "'%s': cut away mid-replay, playout stopped", obs_source_get_name(p->self));
 }
 
+/* OBS loads source-scoped bindings at registration. Read legacy bindings with a
+ * temporary legacy registration, then migrate only if the unique key has none. */
+static obs_hotkey_id register_unique_hotkey(obs_source_t *source, const char *legacy, const char *description,
+					    obs_hotkey_func callback, void *data)
+{
+	obs_hotkey_id old = obs_hotkey_register_source(source, legacy, description, callback, data);
+	obs_data_array_t *bindings = obs_hotkey_save(old);
+	obs_hotkey_unregister(old);
+	char key[256], label[512];
+	snprintf(key, sizeof(key), "SportsReplay.%s.%s", obs_source_get_uuid(source), legacy + strlen("SportsReplay."));
+	snprintf(label, sizeof(label), "%s - %s", description, obs_source_get_name(source));
+	obs_hotkey_id fresh = obs_hotkey_register_source(source, key, label, callback, data);
+	obs_data_array_t *existing = obs_hotkey_save(fresh);
+	if (bindings && obs_data_array_count(bindings) && (!existing || !obs_data_array_count(existing)))
+		obs_hotkey_load(fresh, bindings);
+	obs_data_array_release(existing);
+	obs_data_array_release(bindings);
+	return fresh;
+}
+
 static void *sr_playback_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct sr_playback *p = bzalloc(sizeof(struct sr_playback));
@@ -976,31 +1010,31 @@ static void *sr_playback_create(obs_data_t *settings, obs_source_t *source)
 	p->end_action_override = -1;
 	pthread_mutex_init(&p->mutex, NULL);
 
-	p->hk_capture = obs_hotkey_register_source(source, "SportsReplay.Capture", obs_module_text("Hotkey.Capture"),
-						   hk_capture_cb, p);
-	p->hk_play_pause = obs_hotkey_register_source(source, "SportsReplay.PlayPause",
-						      obs_module_text("Hotkey.PlayPause"), hk_play_pause_cb, p);
-	p->hk_restart = obs_hotkey_register_source(source, "SportsReplay.Restart", obs_module_text("Hotkey.Restart"),
-						   hk_restart_cb, p);
-	p->hk_faster = obs_hotkey_register_source(source, "SportsReplay.Faster", obs_module_text("Hotkey.Faster"),
-						  hk_faster_cb, p);
-	p->hk_slower = obs_hotkey_register_source(source, "SportsReplay.Slower", obs_module_text("Hotkey.Slower"),
-						  hk_slower_cb, p);
-	p->hk_normal = obs_hotkey_register_source(source, "SportsReplay.NormalSpeed",
-						  obs_module_text("Hotkey.NormalSpeed"), hk_normal_cb, p);
-	p->hk_half = obs_hotkey_register_source(source, "SportsReplay.HalfSpeed", obs_module_text("Hotkey.HalfSpeed"),
-						hk_half_cb, p);
-	p->hk_quarter = obs_hotkey_register_source(source, "SportsReplay.QuarterSpeed",
-						   obs_module_text("Hotkey.QuarterSpeed"), hk_quarter_cb, p);
-	p->hk_reverse = obs_hotkey_register_source(source, "SportsReplay.ReverseToggle",
-						   obs_module_text("Hotkey.ReverseToggle"), hk_reverse_cb, p);
-	p->hk_play_last = obs_hotkey_register_source(source, "SportsReplay.PlayLast",
-						     obs_module_text("Hotkey.PlayLast"), hk_play_last_cb, p);
-	p->hk_send_to_program = obs_hotkey_register_source(source, "SportsReplay.SendToProgram",
-							   obs_module_text("Hotkey.SendToProgram"),
-							   hk_send_to_program_cb, p);
-	p->hk_capture_only = obs_hotkey_register_source(source, "SportsReplay.CaptureOnly",
-							obs_module_text("Hotkey.CaptureOnly"), hk_capture_only_cb, p);
+	p->hk_capture = register_unique_hotkey(source, "SportsReplay.Capture", obs_module_text("Hotkey.Capture"),
+					       hk_capture_cb, p);
+	p->hk_play_pause = register_unique_hotkey(source, "SportsReplay.PlayPause", obs_module_text("Hotkey.PlayPause"),
+						  hk_play_pause_cb, p);
+	p->hk_restart = register_unique_hotkey(source, "SportsReplay.Restart", obs_module_text("Hotkey.Restart"),
+					       hk_restart_cb, p);
+	p->hk_faster = register_unique_hotkey(source, "SportsReplay.Faster", obs_module_text("Hotkey.Faster"),
+					      hk_faster_cb, p);
+	p->hk_slower = register_unique_hotkey(source, "SportsReplay.Slower", obs_module_text("Hotkey.Slower"),
+					      hk_slower_cb, p);
+	p->hk_normal = register_unique_hotkey(source, "SportsReplay.NormalSpeed", obs_module_text("Hotkey.NormalSpeed"),
+					      hk_normal_cb, p);
+	p->hk_half = register_unique_hotkey(source, "SportsReplay.HalfSpeed", obs_module_text("Hotkey.HalfSpeed"),
+					    hk_half_cb, p);
+	p->hk_quarter = register_unique_hotkey(source, "SportsReplay.QuarterSpeed",
+					       obs_module_text("Hotkey.QuarterSpeed"), hk_quarter_cb, p);
+	p->hk_reverse = register_unique_hotkey(source, "SportsReplay.ReverseToggle",
+					       obs_module_text("Hotkey.ReverseToggle"), hk_reverse_cb, p);
+	p->hk_play_last = register_unique_hotkey(source, "SportsReplay.PlayLast", obs_module_text("Hotkey.PlayLast"),
+						 hk_play_last_cb, p);
+	p->hk_send_to_program = register_unique_hotkey(source, "SportsReplay.SendToProgram",
+						       obs_module_text("Hotkey.SendToProgram"), hk_send_to_program_cb,
+						       p);
+	p->hk_capture_only = register_unique_hotkey(source, "SportsReplay.CaptureOnly",
+						    obs_module_text("Hotkey.CaptureOnly"), hk_capture_only_cb, p);
 
 	sr_playback_update(p, settings);
 	return p;
@@ -1033,6 +1067,7 @@ static void sr_playback_destroy(void *data)
 	bfree(p->intro_path);
 	bfree(p->outro_path);
 	bfree(p->capture_source_name);
+	bfree(p->capture_id);
 	pthread_mutex_destroy(&p->mutex);
 	bfree(p);
 }
@@ -1094,6 +1129,7 @@ static obs_properties_t *sr_playback_properties(void *data)
 	obs_properties_add_path(props, S_INTRO_CLIP, obs_module_text("IntroClip"), OBS_PATH_FILE, media_filter, NULL);
 	obs_properties_add_path(props, S_OUTRO_CLIP, obs_module_text("OutroClip"), OBS_PATH_FILE, media_filter, NULL);
 	obs_properties_add_bool(props, S_MUTED, obs_module_text("RunMuted"));
+	obs_properties_add_bool(props, "save_audio", obs_module_text("SaveAudio"));
 
 	/* button2: the plain obs_properties_add_button() is deprecated, and the
 	 * CI builds with -Werror. Handing the source's own data in as priv
@@ -1115,18 +1151,25 @@ static void sr_playback_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_END_ACTION, SR_END_FREEZE);
 	obs_data_set_default_bool(settings, S_AUTOPLAY, true);
 	obs_data_set_default_bool(settings, S_MUTED, false);
+	obs_data_set_default_bool(settings, "save_audio", true);
 }
 
 static uint32_t sr_playback_get_width(void *data)
 {
 	struct sr_playback *p = data;
-	return p->have_replay ? p->replay.width : 0;
+	pthread_mutex_lock(&p->mutex);
+	uint32_t width = p->have_replay ? p->replay.width : 0;
+	pthread_mutex_unlock(&p->mutex);
+	return width;
 }
 
 static uint32_t sr_playback_get_height(void *data)
 {
 	struct sr_playback *p = data;
-	return p->have_replay ? p->replay.height : 0;
+	pthread_mutex_lock(&p->mutex);
+	uint32_t height = p->have_replay ? p->replay.height : 0;
+	pthread_mutex_unlock(&p->mutex);
+	return height;
 }
 
 struct obs_source_info sr_playback_info = {

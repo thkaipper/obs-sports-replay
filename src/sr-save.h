@@ -27,6 +27,9 @@ extern "C" {
 /* Muxes a captured replay's already-encoded packets into an mp4 file at
  * path, without re-encoding. Returns true on success. */
 bool sr_save_replay(const struct sr_replay *r, const char *path);
+/* Publishes path only after successful MP4 finalization and durable close.
+ * NULL indicates success; otherwise returns a stable error code. */
+const char *sr_save_replay_ex(const struct sr_replay *r, const char *path, bool save_audio);
 
 #ifdef __cplusplus
 }

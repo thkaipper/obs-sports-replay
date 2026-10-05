@@ -23,7 +23,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/darray.h>
 #include <util/threading.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <libavcodec/avcodec.h>
+#ifdef __cplusplus
+}
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,7 +39,8 @@ extern "C" {
  * encoded as an intra frame, any packet can be decoded on its own. */
 struct sr_packet {
 	AVPacket *pkt;
-	uint64_t ts; /* OBS timestamp in nanoseconds */
+	uint64_t ts;         /* OBS timestamp in nanoseconds */
+	uint64_t arrival_ns; /* monotonic arrival for cross-source cutoff */
 };
 
 /* One chunk of captured audio, float planar. */
@@ -92,6 +99,7 @@ void sr_buffer_push_audio(struct sr_buffer *b, const struct obs_audio_data *audi
 /* Copies the current buffer contents into out (packets are ref-counted
  * clones, audio is duplicated). Returns false if there is no video yet. */
 bool sr_buffer_snapshot(struct sr_buffer *b, struct sr_replay *out);
+bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns);
 
 void sr_replay_free(struct sr_replay *r);
 

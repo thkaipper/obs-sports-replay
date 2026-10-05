@@ -17,6 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "sr-buffer.h"
+#include <util/platform.h>
 
 void sr_buffer_init(struct sr_buffer *b)
 {
@@ -115,7 +116,7 @@ static void evict_expired_video(struct sr_buffer *b, uint64_t now)
 
 void sr_buffer_push_video(struct sr_buffer *b, AVPacket *pkt, uint64_t ts)
 {
-	struct sr_packet entry = {.pkt = pkt, .ts = ts};
+	struct sr_packet entry = {.pkt = pkt, .ts = ts, .arrival_ns = os_gettime_ns()};
 
 	pthread_mutex_lock(&b->mutex);
 	deque_push_back(&b->video, &entry, sizeof(entry));
@@ -162,24 +163,43 @@ void sr_buffer_push_audio(struct sr_buffer *b, const struct obs_audio_data *audi
 	pthread_mutex_unlock(&b->mutex);
 }
 
-bool sr_buffer_snapshot(struct sr_buffer *b, struct sr_replay *out)
+bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns)
 {
 	memset(out, 0, sizeof(*out));
 
 	pthread_mutex_lock(&b->mutex);
 
-	const size_t video_count = b->video.size / sizeof(struct sr_packet);
+	size_t video_count = b->video.size / sizeof(struct sr_packet);
+	while (video_count && cutoff_ns && video_at(b, video_count - 1)->arrival_ns > cutoff_ns)
+		video_count--;
 	if (!video_count) {
 		pthread_mutex_unlock(&b->mutex);
 		return false;
 	}
 
-	da_reserve(out->video, video_count);
-	for (size_t i = 0; i < video_count; i++) {
+	size_t begin = 0;
+	if (duration_ns) {
+		uint64_t end = video_at(b, video_count - 1)->ts;
+		uint64_t first = end > duration_ns ? end - duration_ns : 0;
+		for (size_t i = 0; i < video_count; i++) {
+			if (video_at(b, i)->ts > first)
+				break;
+			if (is_keyframe(video_at(b, i)))
+				begin = i;
+		}
+	}
+	da_reserve(out->video, video_count - begin);
+	for (size_t i = begin; i < video_count; i++) {
 		struct sr_packet *src = deque_data(&b->video, i * sizeof(struct sr_packet));
-		struct sr_packet copy = {.pkt = av_packet_clone(src->pkt), .ts = src->ts};
-		if (copy.pkt)
-			da_push_back(out->video, &copy);
+		struct sr_packet copy = {.pkt = av_packet_clone(src->pkt),
+					 .ts = src->ts,
+					 .arrival_ns = src->arrival_ns};
+		if (!copy.pkt) {
+			pthread_mutex_unlock(&b->mutex);
+			sr_replay_free(out);
+			return false;
+		}
+		da_push_back(out->video, &copy);
 	}
 
 	const size_t audio_count = b->audio.size / sizeof(struct sr_audio_chunk);
@@ -218,6 +238,11 @@ bool sr_buffer_snapshot(struct sr_buffer *b, struct sr_replay *out)
 	out->first_ts = out->video.array[0].ts;
 	out->last_ts = out->video.array[out->video.num - 1].ts;
 	return true;
+}
+
+bool sr_buffer_snapshot(struct sr_buffer *b, struct sr_replay *out)
+{
+	return sr_buffer_snapshot_at(b, out, 0, 0);
 }
 
 void sr_replay_free(struct sr_replay *r)

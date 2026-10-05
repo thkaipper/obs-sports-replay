@@ -72,6 +72,7 @@ jobs:
           fi
 
   macos-build:
+    if: false # Windows x64 is the validated target of this fork.
     name: Build for macOS 🍏
     runs-on: macos-15
     needs: check-event
@@ -176,6 +177,7 @@ jobs:
           key: ${{ runner.os }}-ccache-${{ needs.check-event.outputs.config }}
 
   ubuntu-build:
+    if: false # Linux is not validated for this integration release.
     name: Build for Ubuntu 🐧
     strategy:
       matrix:

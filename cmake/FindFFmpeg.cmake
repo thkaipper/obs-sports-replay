@@ -52,6 +52,6 @@ else()
   include(FindPackageHandleStandardArgs)
   find_package_handle_standard_args(
     FFmpeg
-    REQUIRED_VARS FFMPEG_avcodec_LIBRARY FFMPEG_avutil_LIBRARY FFMPEG_swscale_LIBRARY FFMPEG_avformat_LIBRARY
+    REQUIRED_VARS FFmpeg_FOUND FFMPEG_avcodec_INCLUDE_DIR FFMPEG_avutil_INCLUDE_DIR FFMPEG_swscale_INCLUDE_DIR FFMPEG_avformat_INCLUDE_DIR FFMPEG_avcodec_LIBRARY FFMPEG_avutil_LIBRARY FFMPEG_swscale_LIBRARY FFMPEG_avformat_LIBRARY
   )
 endif()
