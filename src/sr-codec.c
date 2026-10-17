@@ -34,6 +34,7 @@ struct sr_encoder {
 	int64_t next_pts;
 	uint64_t timestamps[256];
 	bool unsupported_format_logged;
+	bool failed;
 };
 
 struct sr_decoder {
@@ -240,8 +241,10 @@ AVPacket *sr_encoder_encode(struct sr_encoder *enc, const struct obs_source_fram
 	if (!enc->sws)
 		return NULL;
 
-	if (av_frame_make_writable(enc->frame) < 0)
+	if (av_frame_make_writable(enc->frame) < 0) {
+		enc->failed = true;
 		return NULL;
+	}
 
 	const uint8_t *src_data[MAX_AV_PLANES] = {0};
 	int src_linesize[MAX_AV_PLANES] = {0};
@@ -257,8 +260,10 @@ AVPacket *sr_encoder_encode(struct sr_encoder *enc, const struct obs_source_fram
 	int sent = avcodec_send_frame(enc->ctx, enc->frame);
 	if (sent >= 0)
 		enc->next_pts++;
-	else if (sent != AVERROR(EAGAIN))
+	else if (sent != AVERROR(EAGAIN)) {
+		enc->failed = true;
 		return NULL;
+	}
 
 	AVPacket *pkt = av_packet_alloc();
 	if (!pkt)
@@ -266,6 +271,7 @@ AVPacket *sr_encoder_encode(struct sr_encoder *enc, const struct obs_source_fram
 
 	const int ret = avcodec_receive_packet(enc->ctx, pkt);
 	if (ret < 0) {
+		enc->failed = ret != AVERROR(EAGAIN);
 		av_packet_free(&pkt);
 		return NULL;
 	}
@@ -276,6 +282,11 @@ AVPacket *sr_encoder_encode(struct sr_encoder *enc, const struct obs_source_fram
 	pkt->pts = pkt->dts = (int64_t)enc->timestamps[(size_t)pkt->pts % 256];
 	pkt->time_base = (AVRational){1, 1000000000};
 	return pkt;
+}
+
+bool sr_encoder_failed(const struct sr_encoder *enc)
+{
+	return enc && enc->failed;
 }
 
 enum AVCodecID sr_encoder_codec_id(const struct sr_encoder *enc)

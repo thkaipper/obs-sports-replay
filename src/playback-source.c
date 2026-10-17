@@ -99,6 +99,11 @@ struct sr_playback {
 	/* playhead is an absolute timestamp within [first_ts, last_ts] */
 	uint64_t playhead;
 	size_t audio_idx;
+	bool first_tick;
+	bool audio_clock_valid;
+	uint64_t audio_clock_ns;
+	uint64_t audio_clock_position;
+	uint64_t audio_next_ns;
 
 	float bounce_countdown; /* seconds left before leaving a replay scene
 				   that has nothing to play; 0 = not pending */
@@ -157,7 +162,8 @@ static void gop_cache_clear(struct sr_playback *p);
 /* Takes ownership of *replay, replacing any current one, and starts playing.
  * end_action_override >= 0 forces that end action (e.g. return-to-scene for
  * replays launched from a file); -1 uses the source's configured action. */
-static void sr_playback_install_replay(struct sr_playback *p, struct sr_replay *replay, int end_action_override)
+static void sr_playback_install_replay(struct sr_playback *p, struct sr_replay *replay, int end_action_override,
+				       bool from_file)
 {
 	pthread_mutex_lock(&p->mutex);
 
@@ -167,6 +173,7 @@ static void sr_playback_install_replay(struct sr_playback *p, struct sr_replay *
 	p->have_replay = true;
 	p->end_action_override = end_action_override;
 	p->bounce_countdown = 0.0f;
+	p->skip_next_autocapture = from_file && !obs_source_active(p->self);
 
 	gop_cache_clear(p);
 	sr_decoder_destroy(p->decoder);
@@ -279,7 +286,7 @@ static bool sr_playback_capture_replay_ex(struct sr_playback *p, bool play)
 		(double)(replay.last_ts - replay.first_ts) / 1e9);
 
 	if (play)
-		sr_playback_install_replay(p, &replay, -1);
+		sr_playback_install_replay(p, &replay, -1, false);
 	else
 		sr_replay_free(&replay);
 
@@ -291,17 +298,17 @@ static bool sr_playback_capture_replay(struct sr_playback *p)
 	return sr_playback_capture_replay_ex(p, true);
 }
 
-void sr_playback_play_file(obs_source_t *source, const char *path)
+bool sr_playback_play_file(obs_source_t *source, const char *path)
 {
 	if (!source || strcmp(obs_source_get_unversioned_id(source), SR_PLAYBACK_ID) != 0)
-		return;
+		return false;
 	struct sr_playback *p = obs_obj_get_data(source);
 	if (!p || !path || !*path)
-		return;
+		return false;
 
 	struct sr_replay replay;
 	if (!sr_load_replay(path, &replay))
-		return;
+		return false;
 
 	/* Replays launched from a file always hand the program back when they
 	 * end - freezing on a still or looping forever would strand the
@@ -311,13 +318,8 @@ void sr_playback_play_file(obs_source_t *source, const char *path)
 	const int end_action = (p->end_action == SR_END_CAMERA) ? SR_END_CAMERA : SR_END_RETURN;
 	pthread_mutex_unlock(&p->mutex);
 
-	sr_playback_install_replay(p, &replay, end_action);
-
-	/* the dock switches to the replay scene right after this, which fires
-	 * activate; don't let autoplay overwrite the file we just loaded */
-	pthread_mutex_lock(&p->mutex);
-	p->skip_next_autocapture = true;
-	pthread_mutex_unlock(&p->mutex);
+	sr_playback_install_replay(p, &replay, end_action, true);
+	return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -449,6 +451,8 @@ static void sr_playback_begin_sequence(struct sr_playback *p)
 {
 	p->paused = false;
 	p->playing = true;
+	p->first_tick = true;
+	p->audio_clock_valid = false;
 
 	if (p->intro_clip) {
 		sr_clip_set_output_size(p->intro_clip, p->replay.width, p->replay.height);
@@ -469,6 +473,14 @@ static void sr_playback_begin_replay_phase(struct sr_playback *p)
 	p->audio_idx = 0;
 	p->playhead = p->backward ? p->replay.last_ts : p->replay.first_ts;
 	p->phase = PHASE_REPLAY;
+	p->first_tick = true;
+	p->audio_clock_valid = false;
+}
+
+static uint64_t replay_end(const struct sr_replay *r)
+{
+	uint64_t tail = r->video.num > 1 ? r->last_ts - r->video.array[r->video.num - 2].ts : 33333333;
+	return r->last_ts + tail;
 }
 
 /* find the frame whose timestamp is closest below the playhead */
@@ -489,22 +501,44 @@ static size_t frame_index_for_playhead(struct sr_playback *p)
 
 static void sr_playback_output_audio(struct sr_playback *p, uint64_t from, uint64_t to)
 {
-	if (p->backward || p->speed_percent != 100.0)
+	if (p->backward || p->speed_percent != 100.0 || !p->replay.samples_per_sec) {
+		p->audio_clock_valid = false;
 		return;
+	}
+	if (!p->audio_clock_valid) {
+		p->audio_clock_ns = os_gettime_ns();
+		p->audio_clock_position = from;
+		p->audio_next_ns = 0;
+		p->audio_clock_valid = true;
+	}
+	const uint32_t rate = p->replay.samples_per_sec;
+	const uint64_t limit = replay_end(&p->replay);
 
 	while (p->audio_idx < p->replay.audio.num) {
 		const struct sr_audio_chunk *chunk = &p->replay.audio.array[p->audio_idx];
 		if (chunk->ts > to)
 			break;
-		if (chunk->ts > from && !p->muted) {
+		/* Whole chunks may cross a tick boundary. Each is emitted once;
+		 * trim only samples preceding the resume position or past the clip. */
+		uint64_t skip = from > chunk->ts ? ((from - chunk->ts) * rate + 999999999ULL) / 1000000000ULL : 0;
+		uint64_t frames = chunk->frames;
+		if (chunk->ts >= limit)
+			frames = 0;
+		else if ((limit - chunk->ts) * rate / 1000000000ULL < frames)
+			frames = (limit - chunk->ts) * rate / 1000000000ULL;
+		if (skip < frames && !p->muted) {
 			struct obs_source_audio out = {0};
 			for (size_t i = 0; i < MAX_AV_PLANES; i++)
-				out.data[i] = (const uint8_t *)chunk->data[i];
-			out.frames = chunk->frames;
+				out.data[i] = chunk->data[i] ? (const uint8_t *)(chunk->data[i] + skip) : NULL;
+			out.frames = (uint32_t)(frames - skip);
 			out.speakers = p->replay.speakers;
 			out.samples_per_sec = p->replay.samples_per_sec;
 			out.format = AUDIO_FORMAT_FLOAT_PLANAR;
-			out.timestamp = os_gettime_ns();
+			uint64_t position = chunk->ts + skip * 1000000000ULL / rate;
+			out.timestamp = p->audio_clock_ns + (position - p->audio_clock_position);
+			if (out.timestamp < p->audio_next_ns)
+				out.timestamp = p->audio_next_ns;
+			p->audio_next_ns = out.timestamp + (out.frames * 1000000000ULL + rate - 1) / rate;
 			obs_source_output_audio(p->self, &out);
 		}
 		p->audio_idx++;
@@ -548,6 +582,7 @@ static void sr_playback_tick(void *data, float seconds)
 	}
 
 	if (!p->have_replay || !p->playing || p->paused) {
+		p->audio_clock_valid = false;
 		pthread_mutex_unlock(&p->mutex);
 		return;
 	}
@@ -579,7 +614,10 @@ static void sr_playback_tick(void *data, float seconds)
 	/* PHASE_REPLAY */
 	const uint64_t prev_playhead = p->playhead;
 	const double delta_d = (double)seconds * 1e9 * (p->speed_percent / 100.0);
-	const uint64_t delta = (uint64_t)delta_d;
+	/* Keep the initial image on screen for one tick, including after restart
+	 * and loop. Advancing first would skip frame zero at normal speed. */
+	const uint64_t delta = p->first_tick ? 0 : (uint64_t)delta_d;
+	p->first_tick = false;
 
 	bool ended = false;
 	if (p->backward) {
@@ -602,16 +640,14 @@ static void sr_playback_tick(void *data, float seconds)
 	if ((int64_t)idx != p->cur_idx)
 		sr_playback_output_frame_at(p, idx);
 
-	sr_playback_output_audio(p, prev_playhead, p->playhead);
+	sr_playback_output_audio(p, prev_playhead, ended ? replay_end(&p->replay) : p->playhead);
 
 	int hand_over = -1;
 	if (ended) {
 		const int ea = sr_playback_effective_end_action(p);
 		if (ea == SR_END_LOOP) {
 			/* loop the replay footage only, skipping intro/outro */
-			p->playhead = p->backward ? p->replay.last_ts : p->replay.first_ts;
-			p->audio_idx = 0;
-			p->cur_idx = -1;
+			sr_playback_begin_replay_phase(p);
 		} else if (p->outro_clip) {
 			sr_clip_set_output_size(p->outro_clip, p->replay.width, p->replay.height);
 			sr_clip_rewind(p->outro_clip);
@@ -966,6 +1002,8 @@ static void sr_playback_deactivate(void *data)
 
 	pthread_mutex_lock(&p->mutex);
 	p->bounce_countdown = 0.0f;
+	p->skip_next_autocapture = false;
+	p->audio_clock_valid = false;
 	const bool was_playing = p->playing;
 	if (was_playing) {
 		p->playing = false;

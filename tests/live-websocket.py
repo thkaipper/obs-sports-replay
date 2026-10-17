@@ -43,17 +43,17 @@ async def main():
 
         info = await vendor("GetPluginInfo")
         assert info["integration_api_version"] == 1
-        assert info["plugin_version"] == "1.3.1"
+        expected = json.loads((pathlib.Path(__file__).resolve().parent.parent / "buildspec.json").read_text(encoding="utf-8"))["version"]
+        assert info["plugin_version"] == expected
         print("PASS: real authenticated WebSocket + Vendor API", flush=True)
-        scenes = (await request("GetSceneList"))["scenes"]
-        if not any(s["sceneName"] == "Integration Scene" for s in scenes):
-            await request("CreateScene", {"sceneName": "Integration Scene"})
-        await request("SetCurrentProgramScene", {"sceneName": "Integration Scene"})
-        for old_input in (await request("GetInputList"))["inputs"]:
-            await request("RemoveInput", {"inputName": old_input["inputName"]})
-        names = ["Integration Camera A", "Integration Camera B"]
+        previous_scene = (await request("GetCurrentProgramScene"))["currentProgramSceneName"]
+        token = uuid.uuid4().hex[:10]
+        scene_name = "Integration Scene " + token
+        await request("CreateScene", {"sceneName": scene_name})
+        await request("SetCurrentProgramScene", {"sceneName": scene_name})
+        names = ["Integration Camera A " + token, "Integration Camera B " + token]
         for name in names:
-            await request("CreateInput", {"sceneName": "Integration Scene", "inputName": name, "inputKind": "ffmpeg_source", "inputSettings": {
+            await request("CreateInput", {"sceneName": scene_name, "inputName": name, "inputKind": "ffmpeg_source", "inputSettings": {
                 "is_local_file": True, "local_file": str(pathlib.Path(sys.argv[2]).resolve()), "looping": True,
                 "restart_on_activate": True, "close_when_inactive": False}, "sceneItemEnabled": True})
             await request("CreateSourceFilter", {"sourceName": name, "filterName": "Sports Capture", "filterKind": "sports_replay_capture",
@@ -61,6 +61,7 @@ async def main():
         captures = []
         for _ in range(100):
             captures = (await vendor("ListCaptureSources"))["capture_sources"]
+            captures = [c for c in captures if c["source_name"] in names]
             if len(captures) == 2 and all(c["buffer_frames"] >= 30 and c["status"] in ("OK", "DEGRADED") for c in captures):
                 break
             await asyncio.sleep(0.1)
@@ -92,6 +93,8 @@ async def main():
         # Delete only the sources created above, in this test instance.
         for name in names:
             await request("RemoveInput", {"inputName": name})
+        await request("SetCurrentProgramScene", {"sceneName": previous_scene})
+        await request("RemoveScene", {"sceneName": scene_name})
 
 
 if __name__ == "__main__":

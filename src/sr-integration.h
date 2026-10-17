@@ -17,6 +17,8 @@ bool sr_integration_save_manual(const struct sr_replay *replay, const char *capt
 /* Capture callbacks serialize state/encoder and snapshot access. */
 obs_data_t *sr_capture_health(void *data);
 bool sr_capture_snapshot_at(void *data, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns);
+const char *sr_capture_snapshot_bounded(void *data, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns,
+					bool audio, size_t max_bytes);
 #ifdef __cplusplus
 }
 #endif

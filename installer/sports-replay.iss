@@ -3,7 +3,7 @@
 
 #define MyName "Sports Replay for OBS Studio"
 #ifndef MyVersion
-  #define MyVersion "1.3.1"
+  #define MyVersion "1.3.2"
 #endif
 #define MyPublisher "Systec"
 #define MyURL "https://www.systecinformatica.com.ar"

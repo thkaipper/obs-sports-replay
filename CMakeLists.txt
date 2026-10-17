@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.28...3.30)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/buildspec.json")
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
@@ -22,10 +23,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(FFmpeg REQUIRED)
-target_link_libraries(
-  ${CMAKE_PROJECT_NAME}
-  PRIVATE FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::avformat
-)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::avformat)
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
@@ -73,12 +71,96 @@ if(SR_BUILD_TESTS)
   target_compile_features(sr-integration-test PRIVATE cxx_std_17)
   target_compile_definitions(sr-integration-test PRIVATE NOMINMAX)
   target_include_directories(sr-integration-test PRIVATE src)
-  target_link_libraries(sr-integration-test PRIVATE OBS::libobs Qt6::Core Qt6::Widgets FFmpeg::avformat FFmpeg::avcodec FFmpeg::avutil)
-  add_executable(sr-media-test tests/media-unit.cpp src/sr-buffer.c src/sr-codec.c src/sr-load.c src/sr-clip.c src/sr-save.cpp)
+  target_link_libraries(
+    sr-integration-test
+    PRIVATE OBS::libobs Qt6::Core Qt6::Widgets FFmpeg::avformat FFmpeg::avcodec FFmpeg::avutil
+  )
+  add_executable(
+    sr-media-test
+    tests/media-unit.cpp
+    src/sr-buffer.c
+    src/sr-codec.c
+    src/sr-load.c
+    src/sr-clip.c
+    src/sr-save.cpp
+  )
   target_compile_features(sr-media-test PRIVATE cxx_std_17)
   target_compile_definitions(sr-media-test PRIVATE NOMINMAX)
   target_include_directories(sr-media-test PRIVATE src)
-  target_link_libraries(sr-media-test PRIVATE plugin-support OBS::libobs Qt6::Core FFmpeg::avformat FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale)
+  target_link_libraries(
+    sr-media-test
+    PRIVATE plugin-support OBS::libobs Qt6::Core FFmpeg::avformat FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale
+  )
+
+  add_executable(
+    sr-playback-test
+    tests/playback-regression.c
+    src/sr-buffer.c
+    src/sr-codec.c
+    src/sr-load.c
+    src/sr-clip.c
+  )
+  add_executable(sr-capture-test tests/capture-regression.c src/sr-buffer.c)
+  add_executable(
+    sr-initialization-test
+    tests/initialization-regression.cpp
+    src/capture-filter.c
+    src/sr-buffer.c
+    src/sr-codec.c
+    src/sr-save.cpp
+  )
+  add_executable(sr-dock-test tests/dock-regression.cpp src/sr-scene-tracker.c)
+  foreach(test_target sr-playback-test sr-capture-test sr-initialization-test sr-dock-test)
+    target_compile_features(${test_target} PRIVATE cxx_std_17)
+    target_compile_definitions(${test_target} PRIVATE NOMINMAX)
+    target_include_directories(${test_target} PRIVATE src)
+    target_link_libraries(
+      ${test_target}
+      PRIVATE
+        plugin-support
+        OBS::libobs
+        OBS::obs-frontend-api
+        Qt6::Core
+        Qt6::Widgets
+        FFmpeg::avformat
+        FFmpeg::avcodec
+        FFmpeg::avutil
+        FFmpeg::swscale
+    )
+  endforeach()
+
+  set(SR_OBS_RUNTIME_DIR "C:/Program Files/obs-studio" CACHE PATH "OBS installation used by isolated tests")
+  foreach(
+    case
+    media
+    integration
+    capture
+    initialization
+    dock
+  )
+    if(case STREQUAL "media")
+      set(case_target sr-media-test)
+    else()
+      set(case_target sr-${case}-test)
+    endif()
+    add_test(
+      NAME sr-${case}
+      COMMAND
+        ${CMAKE_COMMAND} "-DCASE=${case}" "-DEXE=$<TARGET_FILE:${case_target}>"
+        "-DPLAYBACK=$<TARGET_FILE:sr-playback-test>" "-DDLL=$<TARGET_FILE:${CMAKE_PROJECT_NAME}>"
+        "-DDATA=${CMAKE_CURRENT_SOURCE_DIR}/data" "-DRESULTS=${CMAKE_CURRENT_BINARY_DIR}/test-results/$<CONFIG>" -P
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-case.cmake"
+    )
+    set_tests_properties(sr-${case} PROPERTIES TIMEOUT 120)
+    if(WIN32)
+      set_tests_properties(
+        sr-${case}
+        PROPERTIES
+          ENVIRONMENT "SR_OBS_RUNTIME_DIR=${SR_OBS_RUNTIME_DIR};QT_PLUGIN_PATH=${SR_OBS_RUNTIME_DIR}/bin/64bit"
+          ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SR_OBS_RUNTIME_DIR}/bin/64bit"
+      )
+    endif()
+  endforeach()
 endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

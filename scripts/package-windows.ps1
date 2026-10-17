@@ -1,11 +1,12 @@
 param(
     [string]$BuildDirectory = 'build_x64',
-    [string]$InnoCompiler = ''
+    [string]$InnoCompiler = '',
+    [string]$StageDirectory = 'release/staging'
 )
 $ErrorActionPreference = 'Stop'
 $srRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $srSpec = Get-Content -LiteralPath (Join-Path $srRoot 'buildspec.json') -Raw | ConvertFrom-Json
-$srStage = Join-Path $srRoot 'release/staging'
+$srStage = Join-Path $srRoot $StageDirectory
 New-Item -ItemType Directory -Path $srStage -Force | Out-Null
 cmake --install (Join-Path $srRoot $BuildDirectory) --config RelWithDebInfo --prefix $srStage
 if ($LASTEXITCODE) { throw 'Package staging failed' }

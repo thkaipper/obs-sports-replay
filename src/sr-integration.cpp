@@ -189,12 +189,13 @@ QJsonObject status_locked(const QString &key)
 		return it->second->metadata;
 	return read_json(journal(key));
 }
-size_t replay_bytes(const sr_replay &r)
+size_t replay_bytes(const sr_replay &r, bool audio = true)
 {
-	size_t bytes = static_cast<size_t>(std::max(0, r.extradata_size));
+	size_t bytes =
+		static_cast<size_t>(std::max(0, r.extradata_size)) + (audio ? r.audio.num * sizeof(sr_audio_chunk) : 0);
 	for (size_t i = 0; i < r.video.num; i++)
 		bytes += static_cast<size_t>(r.video.array[i].pkt->size) + sizeof(sr_packet);
-	for (size_t i = 0; i < r.audio.num; i++)
+	for (size_t i = 0; audio && i < r.audio.num; i++)
 		for (size_t ch = 0; ch < MAX_AV_PLANES; ch++)
 			if (r.audio.array[i].data[ch])
 				bytes += static_cast<size_t>(r.audio.array[i].frames) * sizeof(float);
@@ -258,7 +259,7 @@ QJsonObject submit(const QString &event, const QString &capture, int duration_ms
 	if (manual) {
 		{
 			std::lock_guard<std::mutex> lock(jobs_mutex);
-			if (replay_bytes(*manual) > max_bytes - reserved_bytes)
+			if (replay_bytes(*manual, audio) > max_bytes - reserved_bytes)
 				return failure(capture, "MEMORY_LIMIT");
 		}
 		/* Ref video, own audio: playback keeps its original snapshot. */
@@ -276,7 +277,7 @@ QJsonObject submit(const QString &event, const QString &capture, int duration_ms
 		if (manual->extradata_size > 0)
 			job->replay.extradata = static_cast<uint8_t *>(
 				bmemdup(manual->extradata, static_cast<size_t>(manual->extradata_size)));
-		for (size_t i = 0; i < manual->audio.num; i++) {
+		for (size_t i = 0; audio && i < manual->audio.num; i++) {
 			sr_audio_chunk chunk = manual->audio.array[i];
 			for (size_t ch = 0; ch < MAX_AV_PLANES; ch++)
 				if (chunk.data[ch])
@@ -298,18 +299,18 @@ QJsonObject submit(const QString &event, const QString &capture, int duration_ms
 		const char *rejected = state == "OFFLINE" ? "CAMERA_OFFLINE"
 				       : state == "ERROR" ? "ENCODER_UNAVAILABLE"
 							  : nullptr;
+		size_t budget;
 		{
 			std::lock_guard<std::mutex> lock(jobs_mutex);
-			if (static_cast<double>(reserved_bytes) + health["memory_bytes"].toDouble() >
-			    static_cast<double>(max_bytes))
-				rejected = "MEMORY_LIMIT";
+			budget = max_bytes - reserved_bytes;
 		}
-		bool ok = !rejected && data &&
-			  sr_capture_snapshot_at(data, &job->replay, cutoff,
-						 static_cast<uint64_t>(duration_ms) * 1000000ULL);
+		if (!rejected)
+			rejected = sr_capture_snapshot_bounded(data, &job->replay, cutoff,
+							       static_cast<uint64_t>(duration_ms) * 1000000ULL, audio,
+							       budget);
 		obs_source_release(source);
-		if (!ok)
-			return failure(capture, rejected ? rejected : "BUFFER_EMPTY");
+		if (rejected)
+			return failure(capture, rejected);
 		job->metadata["source_name"] = health["source_name"];
 		job->metadata["encoder"] = health["encoder_actual"];
 	}
@@ -495,8 +496,10 @@ void request_callback_impl(obs_data_t *input, obs_data_t *output, void *context)
 		QString id = request["capture_id"].toString();
 		obs_source_t *source = valid_capture(id) ? find_capture(id) : nullptr;
 		if (source) {
-			obs_data_t *h = sr_capture_health(obs_obj_get_data(source));
+			void *data = obs_obj_get_data(source);
+			obs_data_t *h = sr_capture_health(data);
 			result = from_obs(h);
+			result["capture_id"] = id;
 			obs_data_release(h);
 			obs_source_release(source);
 		} else

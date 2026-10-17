@@ -58,6 +58,7 @@ struct sr_capture {
 	uint32_t enc_height;
 	bool encoder_failed;
 	uint64_t encoder_failed_since_ns;
+	uint64_t encoder_started_ns;
 	bool reset_encoder;
 
 	/* timestamp of the last frame the source delivered */
@@ -234,6 +235,9 @@ static struct obs_source_frame *sr_capture_filter_video_impl(void *data, struct 
 			return frame;
 		c->encoder_failed = false;
 	}
+	/* A stalled source must not feed identical timestamps to the encoder. */
+	if (c->have_last_frame && frame->timestamp == c->last_frame_ts)
+		return frame;
 
 	sr_capture_check_clock(c, frame->timestamp);
 
@@ -265,6 +269,8 @@ static struct obs_source_frame *sr_capture_filter_video_impl(void *data, struct 
 			return frame;
 		}
 		c->reset_encoder = false;
+		c->encoder_started_ns = os_gettime_ns();
+		c->last_packet_ns = 0;
 		c->enc_width = frame->width;
 		c->enc_height = frame->height;
 
@@ -284,6 +290,18 @@ static struct obs_source_frame *sr_capture_filter_video_impl(void *data, struct 
 	if (pkt) {
 		c->last_packet_ns = os_gettime_ns();
 		sr_buffer_push_video(&c->buffer, pkt, (uint64_t)pkt->pts);
+	} else if (sr_encoder_failed(c->encoder) ||
+		   os_gettime_ns() - (c->last_packet_ns ? c->last_packet_ns : c->encoder_started_ns) >=
+			   10000000000ULL) {
+		obs_log(LOG_WARNING, "'%s': replay encoder stalled or failed; retrying in ten seconds",
+			sr_capture_log_name(c));
+		sr_encoder_destroy(c->encoder);
+		c->encoder = NULL;
+		sr_buffer_clear(&c->buffer);
+		c->encoder_failed = true;
+		c->encoder_failed_since_ns = os_gettime_ns();
+		c->last_packet_ns = 0;
+		c->have_last_kept = false;
 	}
 
 	log_buffer_stats(c, frame->timestamp);
@@ -331,17 +349,31 @@ static struct obs_audio_data *sr_capture_filter_audio(void *data, struct obs_aud
 
 bool sr_capture_snapshot_at(void *data, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns)
 {
+	return sr_capture_snapshot_bounded(data, out, cutoff_ns, duration_ns, true, SIZE_MAX) == NULL;
+}
+
+const char *sr_capture_snapshot_bounded(void *data, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns,
+					bool audio, size_t max_bytes)
+{
+	memset(out, 0, sizeof(*out));
+	if (!data)
+		return "BUFFER_EMPTY";
 	struct sr_capture *c = data;
 	pthread_mutex_lock(&c->state_mutex);
-	bool ok = sr_buffer_snapshot_at(&c->buffer, out, cutoff_ns, duration_ns);
+	const char *error = sr_buffer_snapshot_bounded(&c->buffer, out, cutoff_ns, duration_ns, audio, max_bytes);
 	pthread_mutex_unlock(&c->state_mutex);
-	return ok;
+	return error;
 }
 
 obs_data_t *sr_capture_health(void *data)
 {
 	struct sr_capture *c = data;
 	obs_data_t *d = obs_data_create();
+	if (!c) {
+		obs_data_set_string(d, "status", "OFFLINE");
+		obs_data_set_string(d, "encoder_error", "BUFFER_EMPTY");
+		return d;
+	}
 	pthread_mutex_lock(&c->state_mutex);
 	uint64_t now = os_gettime_ns();
 	obs_data_set_string(d, "capture_id", c->capture_id);

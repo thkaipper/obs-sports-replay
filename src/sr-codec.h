@@ -56,6 +56,8 @@ void sr_encoder_destroy(struct sr_encoder *enc);
  * Returns an encoded packet owned by the caller, or NULL if the encoder
  * buffered the frame or the format is unsupported. */
 AVPacket *sr_encoder_encode(struct sr_encoder *enc, const struct obs_source_frame *frame);
+/* Fatal codec error; temporary EAGAIN and an unsupported format do not set it. */
+bool sr_encoder_failed(const struct sr_encoder *enc);
 
 enum AVCodecID sr_encoder_codec_id(const struct sr_encoder *enc);
 const char *sr_encoder_name(const struct sr_encoder *enc);

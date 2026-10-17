@@ -21,6 +21,7 @@
 #include <mutex>
 #include <vector>
 #include <util/platform.h>
+#include "test-runtime.h"
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -141,9 +142,6 @@ static void feed(obs_source_t *source, uint64_t base)
 }
 int main(int argc, char **argv)
 {
-#ifdef _WIN32
-	AddDllDirectory(LR"(C:\Program Files\obs-studio\bin\64bit)");
-#endif
 	QApplication app(argc, argv);
 	ensure(argc >= 4, "arguments: DLL, data, isolated root");
 	QString root = QString::fromUtf8(argv[3]);
@@ -153,23 +151,7 @@ int main(int argc, char **argv)
 	audio.samples_per_sec = 48000;
 	audio.speakers = SPEAKERS_STEREO;
 	ensure(obs_reset_audio(&audio), "48kHz stereo audio");
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4996)
-#endif
-	obs_add_data_path("C:/Program Files/obs-studio/data/libobs/");
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-	obs_video_info video = {};
-	video.graphics_module = "C:/Program Files/obs-studio/bin/64bit/libobs-d3d11.dll";
-	video.fps_num = 30;
-	video.fps_den = 1;
-	video.base_width = video.base_height = video.output_width = video.output_height = 64;
-	video.output_format = VIDEO_FORMAT_NV12;
-	video.colorspace = VIDEO_CS_709;
-	video.range = VIDEO_RANGE_PARTIAL;
-	ensure(obs_reset_video(&video) == OBS_VIDEO_SUCCESS, "isolated 64x64 video clock");
+	ensure(sr_test_video(), "isolated 64x64 video clock");
 	handler = proc_handler_create();
 	proc_handler_add(obs_get_proc_handler(), "void obs_websocket_api_get_ph(out ptr ph)", get_handler, nullptr);
 	proc_handler_add(handler, "void vendor_register(string name, out ptr vendor)", register_vendor, nullptr);

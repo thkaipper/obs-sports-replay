@@ -8,6 +8,7 @@ Ferramentas usadas: Visual Studio 2022 Build Tools, MSVC 19.44.35229, Windows SD
 
 ```powershell
 ./scripts/build-windows.ps1 -Tests
+./scripts/test-windows.ps1 -BuildDirectory build_x64 -ObsRoot 'C:/Program Files/obs-studio'
 ./scripts/package-windows.ps1 -InnoCompiler 'C:/caminho/ISCC.exe'
 ```
 

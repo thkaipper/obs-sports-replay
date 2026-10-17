@@ -1,6 +1,6 @@
 # Sports Replay Vendor API v1
 
-Plugin 1.3.0. Target: OBS Studio 32.2.2 Windows x64. Vendor: `sports-replay`.
+Plugin 1.3.2. Target: OBS Studio 32.2.2 Windows x64. Vendor: `sports-replay`.
 Use the existing authenticated obs-websocket connection. Subscribe to Vendors events
 (`eventSubscriptions` includes 512). No extra server is started by this plugin.
 
@@ -69,6 +69,13 @@ submit that same `(event_id, capture_id)` expecting a new snapshot.
 The queue permits at most 32 active jobs and approximately 512 MiB of owned snapshots.
 These bounds apply to saved-job snapshots, not the live ring buffers or playback GOP
 caches. One worker writes files; video is remuxed without re-encoding.
+
+Starting with 1.3.2, each live ring buffer also has an independent approximate
+512 MiB cap, evicting oldest audio/GOPs when necessary. Available duration may
+therefore be shorter than configured at very high bitrates. Nonincreasing video
+timestamps are not accumulated. Video-only job snapshots do not copy audio;
+duration/cutoff selections retain only overlapping audio chunks and admission
+checks the selected snapshot's budget before copying.
 
 ## Deduplication and restart
 
@@ -170,6 +177,10 @@ encoded packets. An explicit hardware selection that falls back to x264 is DEGRA
 Automatic backend selection reports the actual encoder without marking software
 fallback as degraded. Initial encoder-open failures retry no more often than every
 ten seconds while frames keep arriving.
+
+Fatal errors from an already opened encoder and ten seconds without packets
+also trigger delayed encoder recreation. A filter still initializing can be
+reported as OFFLINE with BUFFER_EMPTY rather than dereferencing incomplete data.
 
 GetHealth reports buffer frame count/duration/memory, received/encoded frame ages,
 encoder requested/actual/error, reset count, queue limits, disk free and last error/save.

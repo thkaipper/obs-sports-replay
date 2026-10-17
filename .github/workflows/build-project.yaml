@@ -285,6 +285,32 @@ jobs:
           target: x64
           config: ${{ needs.check-event.outputs.config }}
 
+      - name: Test media, playback, capture, dock and restart recovery
+        run: |
+          $srSpec = Get-Content buildspec.json -Raw | ConvertFrom-Json
+          $srVersion = $srSpec.dependencies.'obs-studio'.version
+          $srRelease = Invoke-RestMethod "https://api.github.com/repos/obsproject/obs-studio/releases/tags/$srVersion"
+          $srAsset = @($srRelease.assets | Where-Object name -Match '^OBS-Studio-.*-Windows-x64\.zip$')
+          if ($srAsset.Count -ne 1) { throw 'Expected one Windows x64 OBS runtime asset' }
+          $srZip = Join-Path $env:RUNNER_TEMP 'sports-replay-test-obs.zip'
+          $srRuntime = Join-Path $env:RUNNER_TEMP 'sports-replay-test-obs'
+          Invoke-WebRequest $srAsset[0].browser_download_url -OutFile $srZip
+          if ($srAsset[0].digest -like 'sha256:*') {
+            $srHash = (Get-FileHash -LiteralPath $srZip -Algorithm SHA256).Hash.ToLower()
+            if ('sha256:' + $srHash -ne $srAsset[0].digest) { throw 'OBS runtime checksum mismatch' }
+          }
+          Expand-Archive -LiteralPath $srZip -DestinationPath $srRuntime
+          ./scripts/test-windows.ps1 -ObsRoot $srRuntime -Configuration '${{ needs.check-event.outputs.config }}'
+
+      - name: Upload regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-regression-results
+          path: |
+            build_x64/Testing
+            build_x64/test-results
+
       - name: Package Plugin 📀
         uses: ./.github/actions/package-plugin
         with:

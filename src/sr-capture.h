@@ -39,8 +39,8 @@ struct sr_buffer *sr_capture_get_buffer(void *capture_data);
 
 /* Loads a saved replay file into the given Sports Replay playback source and
  * starts playing it (with the same controls as a live replay). Used by the
- * dock's double-click action. No-op if source is not a Sports Replay source. */
-void sr_playback_play_file(obs_source_t *source, const char *path);
+ * dock's double-click action. Returns false when loading fails. */
+bool sr_playback_play_file(obs_source_t *source, const char *path);
 
 #ifdef __cplusplus
 }

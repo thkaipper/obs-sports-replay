@@ -1,6 +1,6 @@
 # Sports Replay for OBS Studio
 
-**Manutenção deste fork: [ITSync](https://itsync.xyz).** Versão 1.3.1: crédito da manutenção adicionado ao rodapé, preservando a autoria original da Systec. Consulte [o guia de logos e patrocinadores](docs/patrocinadores-pt-BR.md) e [as notas desta atualização](docs/release-notes-1.3.1-pt-BR.md).
+**Manutenção deste fork: [ITSync](https://itsync.xyz).** Versão 1.3.2: correções de captura, áudio, reprodução e dock, com testes de regressão. Autoria original da Systec preservada. Consulte [as notas desta atualização](docs/release-notes-1.3.2-pt-BR.md) e [o guia de logos e patrocinadores](docs/patrocinadores-pt-BR.md).
 
 ## Atualização deste fork — 1.3.0
 

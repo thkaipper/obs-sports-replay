@@ -23,6 +23,7 @@ void sr_buffer_init(struct sr_buffer *b)
 {
 	memset(b, 0, sizeof(*b));
 	pthread_mutex_init(&b->mutex, NULL);
+	b->max_bytes = 512ULL * 1024 * 1024;
 }
 
 static void free_video_packet(struct sr_packet *p)
@@ -51,6 +52,7 @@ void sr_buffer_clear(struct sr_buffer *b)
 		deque_pop_front(&b->audio, &c, sizeof(c));
 		free_audio_chunk(&c);
 	}
+	b->video_bytes = b->audio_bytes = 0;
 	pthread_mutex_unlock(&b->mutex);
 }
 
@@ -87,6 +89,51 @@ static bool is_keyframe(const struct sr_packet *p)
 	return (p->pkt->flags & AV_PKT_FLAG_KEY) != 0;
 }
 
+static size_t audio_bytes(const struct sr_audio_chunk *chunk)
+{
+	size_t bytes = sizeof(*chunk);
+	for (size_t ch = 0; ch < MAX_AV_PLANES; ch++)
+		if (chunk->data[ch])
+			bytes += (size_t)chunk->frames * sizeof(float);
+	return bytes;
+}
+
+static void drop_video(struct sr_buffer *b)
+{
+	struct sr_packet packet;
+	deque_pop_front(&b->video, &packet, sizeof(packet));
+	b->video_bytes -= sizeof(packet) + (size_t)packet.pkt->size;
+	free_video_packet(&packet);
+}
+
+static void drop_audio(struct sr_buffer *b)
+{
+	struct sr_audio_chunk chunk;
+	deque_pop_front(&b->audio, &chunk, sizeof(chunk));
+	b->audio_bytes -= audio_bytes(&chunk);
+	free_audio_chunk(&chunk);
+}
+
+/* Never leave an undecodable partial GOP at the front. If one GOP alone is
+ * too large, discard it and wait for the next keyframe. */
+static void enforce_memory_limit(struct sr_buffer *b)
+{
+	while (b->video_bytes + b->audio_bytes > b->max_bytes) {
+		struct sr_audio_chunk first_audio = {0};
+		if (b->audio.size)
+			deque_peek_front(&b->audio, &first_audio, sizeof(first_audio));
+		if (b->video.size && (!b->audio.size || video_at(b, 0)->ts <= first_audio.ts)) {
+			drop_video(b);
+			while (b->video.size && !is_keyframe(video_at(b, 0)))
+				drop_video(b);
+		} else if (b->audio.size) {
+			drop_audio(b);
+		} else {
+			break;
+		}
+	}
+}
+
 /* Drops expired frames from the front. Unless the stream is all-intra a
  * packet is only decodable together with the keyframe that opens its GOP,
  * so whole GOPs are dropped at once and only once every frame in them has
@@ -107,11 +154,8 @@ static void evict_expired_video(struct sr_buffer *b, uint64_t now)
 		next_gop = i;
 	}
 
-	for (size_t i = 0; i < next_gop; i++) {
-		struct sr_packet front;
-		deque_pop_front(&b->video, &front, sizeof(front));
-		free_video_packet(&front);
-	}
+	for (size_t i = 0; i < next_gop; i++)
+		drop_video(b);
 }
 
 void sr_buffer_push_video(struct sr_buffer *b, AVPacket *pkt, uint64_t ts)
@@ -119,8 +163,16 @@ void sr_buffer_push_video(struct sr_buffer *b, AVPacket *pkt, uint64_t ts)
 	struct sr_packet entry = {.pkt = pkt, .ts = ts, .arrival_ns = os_gettime_ns()};
 
 	pthread_mutex_lock(&b->mutex);
+	if ((b->video.size && ts <= video_at(b, b->video.size / sizeof(entry) - 1)->ts) ||
+	    (!b->video.size && !is_keyframe(&entry))) {
+		pthread_mutex_unlock(&b->mutex);
+		av_packet_free(&pkt);
+		return;
+	}
 	deque_push_back(&b->video, &entry, sizeof(entry));
+	b->video_bytes += sizeof(entry) + (size_t)pkt->size;
 	evict_expired_video(b, ts);
+	enforce_memory_limit(b);
 	pthread_mutex_unlock(&b->mutex);
 }
 
@@ -142,28 +194,32 @@ void sr_buffer_push_audio(struct sr_buffer *b, const struct obs_audio_data *audi
 	if (b->audio.size) {
 		struct sr_audio_chunk back;
 		deque_peek_back(&b->audio, &back, sizeof(back));
+		if (chunk.ts == back.ts) {
+			pthread_mutex_unlock(&b->mutex);
+			free_audio_chunk(&chunk);
+			return;
+		}
 		if (chunk.ts < back.ts) {
-			while (b->audio.size) {
-				struct sr_audio_chunk old;
-				deque_pop_front(&b->audio, &old, sizeof(old));
-				free_audio_chunk(&old);
-			}
+			while (b->audio.size)
+				drop_audio(b);
 		}
 	}
 
 	deque_push_back(&b->audio, &chunk, sizeof(chunk));
+	b->audio_bytes += audio_bytes(&chunk);
 
 	struct sr_audio_chunk front;
 	deque_peek_front(&b->audio, &front, sizeof(front));
 	while (b->audio.size > sizeof(chunk) && chunk.ts > front.ts && chunk.ts - front.ts > b->duration_ns) {
-		deque_pop_front(&b->audio, &front, sizeof(front));
-		free_audio_chunk(&front);
+		drop_audio(b);
 		deque_peek_front(&b->audio, &front, sizeof(front));
 	}
+	enforce_memory_limit(b);
 	pthread_mutex_unlock(&b->mutex);
 }
 
-bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns)
+const char *sr_buffer_snapshot_bounded(struct sr_buffer *b, struct sr_replay *out, uint64_t cutoff_ns,
+				       uint64_t duration_ns, bool audio, size_t max_bytes)
 {
 	memset(out, 0, sizeof(*out));
 
@@ -174,7 +230,7 @@ bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t 
 		video_count--;
 	if (!video_count) {
 		pthread_mutex_unlock(&b->mutex);
-		return false;
+		return "BUFFER_EMPTY";
 	}
 
 	size_t begin = 0;
@@ -188,6 +244,25 @@ bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t 
 				begin = i;
 		}
 	}
+	const uint64_t first_ts = video_at(b, begin)->ts;
+	const uint64_t last_ts = video_at(b, video_count - 1)->ts;
+	const uint64_t tail = video_count > begin + 1 ? last_ts - video_at(b, video_count - 2)->ts : 33333333;
+	const uint64_t end_ts = last_ts + tail;
+	const size_t audio_count = audio ? b->audio.size / sizeof(struct sr_audio_chunk) : 0;
+	size_t bytes = (size_t)b->extradata_size;
+	for (size_t i = begin; i < video_count; i++)
+		bytes += sizeof(struct sr_packet) + (size_t)video_at(b, i)->pkt->size;
+	for (size_t i = 0; i < audio_count; i++) {
+		const struct sr_audio_chunk *src = deque_data(&b->audio, i * sizeof(*src));
+		uint64_t end =
+			src->ts + (b->samples_per_sec ? (uint64_t)src->frames * 1000000000ULL / b->samples_per_sec : 0);
+		if (src->ts < end_ts && end > first_ts)
+			bytes += audio_bytes(src);
+	}
+	if (bytes > max_bytes) {
+		pthread_mutex_unlock(&b->mutex);
+		return "MEMORY_LIMIT";
+	}
 	da_reserve(out->video, video_count - begin);
 	for (size_t i = begin; i < video_count; i++) {
 		struct sr_packet *src = deque_data(&b->video, i * sizeof(struct sr_packet));
@@ -197,16 +272,18 @@ bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t 
 		if (!copy.pkt) {
 			pthread_mutex_unlock(&b->mutex);
 			sr_replay_free(out);
-			return false;
+			return "MEMORY_LIMIT";
 		}
 		da_push_back(out->video, &copy);
 	}
 
-	const size_t audio_count = b->audio.size / sizeof(struct sr_audio_chunk);
-	da_reserve(out->audio, audio_count);
 	const uint32_t channels = get_audio_channels(b->speakers);
 	for (size_t i = 0; i < audio_count; i++) {
 		struct sr_audio_chunk *src = deque_data(&b->audio, i * sizeof(struct sr_audio_chunk));
+		uint64_t end =
+			src->ts + (b->samples_per_sec ? (uint64_t)src->frames * 1000000000ULL / b->samples_per_sec : 0);
+		if (src->ts >= end_ts || end <= first_ts)
+			continue;
 		struct sr_audio_chunk copy = {0};
 		copy.frames = src->frames;
 		copy.ts = src->ts;
@@ -232,12 +309,17 @@ bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t 
 
 	if (!out->video.num) {
 		sr_replay_free(out);
-		return false;
+		return "BUFFER_EMPTY";
 	}
 
 	out->first_ts = out->video.array[0].ts;
 	out->last_ts = out->video.array[out->video.num - 1].ts;
-	return true;
+	return NULL;
+}
+
+bool sr_buffer_snapshot_at(struct sr_buffer *b, struct sr_replay *out, uint64_t cutoff_ns, uint64_t duration_ns)
+{
+	return sr_buffer_snapshot_bounded(b, out, cutoff_ns, duration_ns, true, SIZE_MAX) == NULL;
 }
 
 bool sr_buffer_snapshot(struct sr_buffer *b, struct sr_replay *out)

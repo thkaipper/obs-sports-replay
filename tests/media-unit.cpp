@@ -77,6 +77,17 @@ int main(int argc, char **argv)
 	check(crop.video.array[0].pkt->flags & AV_PKT_FLAG_KEY, "duration snapshot starts on a keyframe");
 	check(crop.last_ts - crop.first_ts <= 1500000000ULL, "GOP-aligned crop is bounded");
 	check(sr_buffer_snapshot(&buffer, &full), "full snapshot succeeds");
+	check(crop.audio.num < full.audio.num && at.audio.num < full.audio.num,
+	      "duration and cutoff exclude audio outside the selected video interval");
+	sr_replay silent = {}, denied = {};
+	check(sr_buffer_snapshot_bounded(&buffer, &silent, 0, 1000000000ULL, false, 32768) == nullptr &&
+		      silent.audio.num == 0,
+	      "video-only snapshot fits a small budget without copying buffered audio");
+	const char *budget_error = sr_buffer_snapshot_bounded(&buffer, &denied, 0, 1000000000ULL, true, 32768);
+	check(budget_error && !strcmp(budget_error, "MEMORY_LIMIT") && !denied.video.num && !denied.audio.num,
+	      "audio budget is checked before allocating a snapshot");
+	sr_replay_free(&silent);
+	sr_replay_free(&denied);
 	sr_buffer_clear(&buffer);
 	QString path = QDir(root).filePath("audio.mp4");
 	QByteArray utf8 = path.toUtf8();
@@ -131,5 +142,44 @@ int main(int argc, char **argv)
 	sr_replay_free(&full);
 	sr_buffer_free(&buffer);
 	sr_encoder_destroy(encoder);
+	// Frozen clocks cannot retain unlimited packets, even without a capture filter.
+	sr_buffer guarded;
+	sr_buffer_init(&guarded);
+	guarded.duration_ns = 1000000000ULL;
+	for (int i = 0; i < 1000; i++) {
+		AVPacket *p = av_packet_alloc();
+		p->flags = AV_PKT_FLAG_KEY;
+		sr_buffer_push_video(&guarded, p, 1000000000ULL);
+	}
+	check(guarded.video.size / sizeof(sr_packet) == 1, "repeated video timestamps are discarded");
+	guarded.max_bytes = 4096;
+	for (int i = 1; i <= 100; i++) {
+		AVPacket *p = av_packet_alloc();
+		av_new_packet(p, 1024);
+		p->flags = i % 5 == 0 ? AV_PKT_FLAG_KEY : 0;
+		sr_buffer_push_video(&guarded, p, 1000000000ULL + static_cast<uint64_t>(i));
+	}
+	check(guarded.video_bytes + guarded.audio_bytes <= guarded.max_bytes,
+	      "packet memory stays bounded independently of timestamp progress and GOP length");
+	if (guarded.video.size) {
+		sr_packet head;
+		deque_peek_front(&guarded.video, &head, sizeof(head));
+		check((head.pkt->flags & AV_PKT_FLAG_KEY) != 0, "memory eviction retains a decodable GOP boundary");
+	}
+	obs_audio_data repeated_audio = {};
+	repeated_audio.frames = 1600;
+	repeated_audio.timestamp = 1000000000ULL;
+	repeated_audio.data[0] = reinterpret_cast<uint8_t *>(left.data());
+	guarded.max_bytes = 32768;
+	for (int i = 0; i < 100; i++)
+		sr_buffer_push_audio(&guarded, &repeated_audio, 1);
+	check(guarded.audio.size / sizeof(sr_audio_chunk) == 1, "repeated audio timestamps are discarded");
+	guarded.max_bytes = 4096;
+	repeated_audio.timestamp++;
+	sr_buffer_push_audio(&guarded, &repeated_audio, 1);
+	check(guarded.video_bytes + guarded.audio_bytes <= guarded.max_bytes, "audio also obeys the live memory cap");
+	sr_buffer_clear(&guarded);
+	check(guarded.video_bytes == 0 && guarded.audio_bytes == 0, "buffer reset releases all memory reservations");
+	sr_buffer_free(&guarded);
 	return 0;
 }

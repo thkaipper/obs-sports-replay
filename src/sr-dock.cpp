@@ -136,18 +136,9 @@ obs_source_t *sceneContaining(const char *sourceName)
 {
 	if (!sourceName || !*sourceName)
 		return nullptr;
-	obs_frontend_source_list scenes = {};
-	obs_frontend_get_scenes(&scenes);
-	obs_source_t *result = nullptr;
-	for (size_t i = 0; i < scenes.sources.num; i++) {
-		obs_source_t *sceneSrc = scenes.sources.array[i];
-		obs_scene_t *scene = obs_scene_from_source(sceneSrc);
-		if (scene && obs_scene_find_source(scene, sourceName)) {
-			result = obs_source_get_ref(sceneSrc);
-			break;
-		}
-	}
-	obs_frontend_source_list_free(&scenes);
+	char *name = sr_find_scene_with_source(sourceName);
+	obs_source_t *result = name ? obs_get_source_by_name(name) : nullptr;
+	bfree(name);
 	return result;
 }
 
@@ -391,12 +382,11 @@ private:
 
 		/* drop played-markers for replays that no longer exist (deleted
 		 * from the folder), so the persisted list doesn't grow stale */
-		QSet<QString> existing;
-		for (const QFileInfo &fi : files)
-			existing.insert(fi.absoluteFilePath());
 		bool pruned = false;
 		for (auto it = playedPaths.begin(); it != playedPaths.end();) {
-			if (!existing.contains(*it)) {
+			/* Only prune this folder. Other folders may be on a removable
+			 * drive and their markers must survive changing the selection. */
+			if (QFileInfo(*it).absolutePath() == dir.absolutePath() && !QFileInfo::exists(*it)) {
 				it = playedPaths.erase(it);
 				pruned = true;
 			} else {
@@ -488,20 +478,19 @@ private:
 		if (srcName.isEmpty())
 			return;
 
-		obs_source_t *source = obs_get_source_by_name(srcName.constData());
-		if (source) {
-			sr_playback_play_file(source, path.constData());
-			obs_source_release(source);
-		}
-
 		obs_source_t *scene = sceneContaining(srcName.constData());
-		if (scene) {
-			/* same as the send-to-program hotkey: keep the shot in
-			 * preview from being swapped out for the replay */
-			sr_scene_tracker_note_replay_launch();
-			obs_frontend_set_current_scene(scene);
+		if (!scene)
+			return;
+		obs_source_t *source = obs_get_source_by_name(srcName.constData());
+		bool loaded = source && sr_playback_play_file(source, path.constData());
+		obs_source_release(source);
+		if (!loaded) {
 			obs_source_release(scene);
+			return;
 		}
+		sr_scene_tracker_note_replay_launch();
+		obs_frontend_set_current_scene(scene);
+		obs_source_release(scene);
 
 		if (!playedPaths.contains(filePath)) {
 			playedPaths.insert(filePath);
