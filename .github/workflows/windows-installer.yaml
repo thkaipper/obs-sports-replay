@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Check out repository 📥
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Resolve tag 🏷️
         id: tag
@@ -29,7 +31,22 @@ jobs:
             echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check for an existing installer
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          assets=$(gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
+          if grep -Fxq "sports-replay-${RELEASE_TAG}-windows-installer.exe" <<< "$assets"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download Windows package 📦
+        if: steps.existing.outputs.found != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,17 +59,20 @@ jobs:
           cp ../LICENSE LICENSE.txt
 
       - name: Install Inno Setup 🛠️
+        if: steps.existing.outputs.found != 'true'
         run: choco install innosetup --yes --no-progress
 
       - name: Build installer 🧱
+        if: steps.existing.outputs.found != 'true'
         shell: cmd
         run: iscc "/DMyVersion=${{ steps.tag.outputs.value }}" installer\sports-replay.iss
 
       - name: Upload installer to release 🚀
+        if: steps.existing.outputs.found != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ steps.tag.outputs.value }}" \
             "installer/Output/sports-replay-${{ steps.tag.outputs.value }}-windows-installer.exe" \
-            --repo "${{ github.repository }}" --clobber
+            --repo "${{ github.repository }}"

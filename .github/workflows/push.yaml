@@ -100,8 +100,21 @@ jobs:
             echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
           done
 
-      - name: Create Release 🛫
+      - name: Preserve an existing release
         if: fromJSON(steps.check.outputs.validTag)
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(gh api --paginate "repos/${{ github.repository }}/releases?per_page=100" --jq '.[].tag_name')
+          if grep -Fxq "$GITHUB_REF_NAME" <<< "$tags"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Release 🛫
+        if: fromJSON(steps.check.outputs.validTag) && steps.existing.outputs.found != 'true'
         id: create_release
         uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564
         with:

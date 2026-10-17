@@ -19,4 +19,6 @@ A API Vendor permanece na versão 1, com os mesmos nomes de requests, identifica
 
 Validação local: compilação com warnings tratados como erros, cinco grupos CTest aprovados, 233 verificações internas PASS e teste WebSocket autenticado em OBS portátil separado, com duas fontes reais, AAC, deduplicação e eventos ReplaySaved. Detalhes e limites estão em [Validação das correções](validacao-correcoes-1.3.2.md).
 
-Para instalar, feche o OBS e use o ZIP `sports-replay-1.3.2-windows-x64.zip`: copie a DLL de `sports-replay/bin/64bit` para `obs-plugins/64bit` e as traduções de `sports-replay/data` para `data/obs-plugins/sports-replay`, dentro da instalação do OBS.
+Para instalar, feche o OBS e execute `sports-replay-1.3.2-windows-installer.exe`, selecionando a pasta onde o OBS está instalado. Para instalação manual, use o ZIP `sports-replay-1.3.2-windows-x64.zip`: copie a DLL de `sports-replay/bin/64bit` para `obs-plugins/64bit` e as traduções de `sports-replay/data` para `data/obs-plugins/sports-replay`, dentro da instalação do OBS.
+
+Os pacotes publicados incluem o instalador Windows, ZIP de instalação manual, código-fonte, manifesto de compilação e checksums SHA-256. A automação preserva os arquivos já publicados para manter os checksums válidos.
